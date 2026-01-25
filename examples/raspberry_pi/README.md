@@ -73,6 +73,64 @@ For best results, use standard aspect ratios:
 
 Adjust the script parameters based on your needs and model requirements.
 
+## Recording Keypoint Data
+
+### Transfer record_keypoints.py to Docker
+
+The `record_keypoints.py` script records keypoint detection data with frame timing for analysis:
+
+```bash
+# From host - copy script to Docker container
+docker cp examples/raspberry_pi/record_keypoints.py voyager-sdk-1.5.3:/voyager-sdk/record_keypoints.py
+```
+
+### Run Keypoint Recording
+
+```bash
+# In Docker
+docker exec -it voyager-sdk-1.5.3 /bin/bash
+cd /voyager-sdk
+source venv/bin/activate
+
+# Record keypoint data (saves to /tmp by default - accessible on host)
+AXELERA_CONFIGURE_BOARD=,20 ./record_keypoints.py yolov8mpose-coco usb:10/yuyv --max-frames 300
+
+# Or specify custom output directory in /tmp
+AXELERA_CONFIGURE_BOARD=,20 ./record_keypoints.py yolov8mpose-coco usb:10/yuyv \
+  --record-dir /tmp/my_keypoints \
+  --max-frames 300
+```
+
+### Where Docker Stores Files
+
+**Mounted directories (shared with host):**
+- `/tmp` → `/tmp` (read/write, **recommended for data output**)
+- `/run` → `/run` (read/write)
+- `/lib/modules` → `/lib/modules` (read-only)
+- `/dev` → `/dev` (devices, including video devices)
+
+**Container-only directories (NOT accessible from host):**
+- `/voyager-sdk` (SDK files, isolated)
+- `/home/julian` (user home in container, NOT mounted)
+
+**Best practices:**
+- **Save data to `/tmp`** for immediate host access without copying
+- Data saved to `/voyager-sdk` or `/home/julian` inside container requires `docker cp` to extract
+- Access recorded data on host: `ls /tmp/keypoint_data/`
+
+### Output Format
+
+The script creates a timestamped directory with:
+- `frame_timing.csv` - Frame-by-frame timing and FPS data
+- `keypoints_data/` - JSON files with keypoint coordinates, bounding boxes, and confidence scores for each frame
+
+Example:
+```bash
+# On host - access data immediately
+cat /tmp/keypoint_data/keypoints_20260125_232250/frame_timing.csv
+ls /tmp/keypoint_data/keypoints_20260125_232250/keypoints_data/
+```
+
 ## Troubleshooting
 
 ### "Cannot access device at 10"
