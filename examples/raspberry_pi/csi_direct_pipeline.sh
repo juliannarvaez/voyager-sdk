@@ -42,6 +42,7 @@ rpicam-vid \
   --timeout 0 \
   --inline \
   --flush \
+  --hflip \
   --awb auto \
   --ev 2.5 \
   --brightness 0.1 \
