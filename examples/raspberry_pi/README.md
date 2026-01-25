@@ -36,13 +36,13 @@ echo "options v4l2loopback devices=1 video_nr=10 card_label=\"CSI Camera\"" | su
 
 ```bash
 cd ~/axeleras/voyager-sdk-1.4.2
-./examples/raspberry_pi/csi_direct_pipeline.sh 1280 720 30
+./examples/raspberry_pi/csi_direct_pipeline.sh 640 480 60
 ```
 
 Parameters:
-- Width: 1280 pixels
-- Height: 720 pixels  
-- FPS: 30 frames per second
+- Width: 640 pixels
+- Height: 480 pixels  
+- FPS: 60 frames per second
 - Device (optional): 10 (creates /dev/video10)
 
 **Wait for:** `Setting pipeline to PLAYING ...`
@@ -63,14 +63,16 @@ Replace `yolov8spose-coco` with your deployed model.
 
 **Important:** Use `usb:10/yuyv` (not just `usb:10`) to specify YUY2 format.
 
-## Supported Resolutions
+## Recommended Resolutions
 
-Your IMX296 camera supports:
-- 1456x1088 @ 60fps (native)
-- 1280x720 @ 60fps
-- 640x480 @ 60fps
+For best results, use standard aspect ratios:
+- **640x480 @ 60fps** - **Recommended** (4:3, 60fps end-to-end, 346ms latency)
+- **1280x720 @ 60fps** - Higher resolution (16:9, ~39fps end-to-end, 552ms latency)
+- **640x640 @ 60fps** - Square format (optimal for some YOLO models)
 
-Adjust the script parameters based on your needs.
+**Note:** Avoid using the camera's native 1456x1088 resolution as the non-standard aspect ratio may cause issues with model processing.
+
+Adjust the script parameters based on your needs and model requirements.
 
 ## Troubleshooting
 
