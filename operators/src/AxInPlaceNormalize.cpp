@@ -9,6 +9,9 @@
 
 #if defined __AVX2__
 #define USE_AVX2
+// Use SIMDE to emulate AVX2 on ARM using NEON
+#include <simde/x86/avx2.h>
+#include <simde/x86/avx512.h>
 #endif
 
 struct normalize_properties {
@@ -203,7 +206,7 @@ inplace(const AxDataInterface &data, const normalize_properties *details,
           "inplace_normalize with avx2 works on channel as most contiguous dimension only");
     }
 
-    _MM_SET_ROUNDING_MODE(_MM_ROUND_NEAREST);
+    SIMDE_MM_SET_ROUNDING_MODE(SIMDE_MM_ROUND_NEAREST);
 
     int processing_stride = std::lcm(8, num_ch);
     int num_processings = processing_stride / 8;
@@ -240,13 +243,8 @@ inplace(const AxDataInterface &data, const normalize_properties *details,
         auto input_128 = _mm_cvtsi64_si128(*ptr64++);
         auto input_256 = _mm256_cvtepu8_epi32(input_128);
         auto input_256_f32 = _mm256_cvtepi32_ps(input_256);
-#if __aarch64__
-        //  libsimde does not seem to support fused multiply and add
-        auto tmp = _mm256_mul_ps(input_256_f32, mul_256[j]);
-        auto output_256_f32 = _mm256_add_ps(tmp, add_256[j]);
-#else
+        // Use FMA on all platforms - simde supports it on ARM64 via NEON
         auto output_256_f32 = _mm256_fmadd_ps(input_256_f32, mul_256[j], add_256[j]);
-#endif
         auto output_256 = _mm256_cvtps_epi32(output_256_f32);
         auto output_128 = _mm256_packs_epi32(output_256, output_256);
         auto output_64 = _mm256_packs_epi16(output_128, output_128);

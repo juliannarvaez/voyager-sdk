@@ -41,6 +41,10 @@ rpicam-vid \
   --codec yuv420 \
   --timeout 0 \
   --inline \
+  --awb auto \
+  --ev 2.5 \
+  --brightness 0.1 \
+  --contrast 1.1 \
   -o - | \
 gst-launch-1.0 -v fdsrc ! \
   videoparse width=${WIDTH} height=${HEIGHT} format=i420 framerate=${FPS}/1 ! \
