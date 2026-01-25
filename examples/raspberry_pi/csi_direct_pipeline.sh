@@ -32,7 +32,7 @@ echo "Docker containers can consume this with: usb:${DEVICE_NR}"
 echo ""
 
 # Stream CSI camera to v4l2loopback device using rpicam-vid
-# rpicam-vid handles the camera properly, then we convert to v4l2
+# Using YUY2 format (best performance with this pipeline)
 rpicam-vid \
   --width ${WIDTH} \
   --height ${HEIGHT} \

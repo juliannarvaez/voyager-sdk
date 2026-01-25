@@ -60,7 +60,7 @@ AXELERA_CONFIGURE_BOARD=,20 ./inference.py yolov8spose-coco usb:10/yuyv --show-h
 
 Replace `yolov8spose-coco` with your deployed model.
 
-**Important:** Use `usb:10/yuyv` (not just `usb:10`) to specify YUY2 format.
+**Important:** Use `usb:10/yuyv` (not just `usb:10`) to specify YUY2 format - best performance for this pipeline.
 
 ## Recommended Resolutions
 
