@@ -28,7 +28,6 @@ class FrameKeypointData:
     timestamp: float
     phase: int = 0  # 0: idle, 1: prep, 2: drive, 3: dwelling, 4: recovery
     keypoints: List[Dict[str, Any]] = field(default_factory=list)  # [{"name": "right_shoulder", "x": 100, "y": 200, "confidence": 0.9}, ...]
-    velocities: List[Dict[str, Any]] = field(default_factory=list)  # [{"name": "right_knee", "vx": 1.2, "vy": -0.3, "speed": 1.25}, ...]
     
 
 class KeypointRecorder:
@@ -50,6 +49,9 @@ class KeypointRecorder:
         "right_ankle",     # idx 16
         "right_wrist",     # idx 10
     ]
+    
+    # Pre-computed indices for fast access
+    ROWING_KEYPOINT_INDICES = [6, 12, 14, 16, 10]  # shoulder, hip, knee, ankle, wrist
     
     # Map COCO keypoint names to indices
     COCO_KEYPOINT_MAP = {
@@ -83,6 +85,9 @@ class KeypointRecorder:
         self.buffer_size = buffer_size
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
+        
+        # Reference to phase controller (for force data)
+        self.phase_controller = None
         
         # Circular buffers (auto-pruning with maxlen)
         self.keypoint_buffer = deque(maxlen=buffer_size)
@@ -119,61 +124,52 @@ class KeypointRecorder:
         Returns:
             FrameKeypointData or None if no keypoints found
         """
-        from axelera.app.meta.keypoint import KeypointObjectWithBbox, CocoBodyKeypointsMeta
-        
-        # Find keypoint task meta in container
+        # Fast path: try to get task meta directly without expensive checks
         task_meta = None
-        for key, tmeta in meta.items():
-            if isinstance(tmeta, CocoBodyKeypointsMeta) or 'keypoint' in key.lower() or 'pose' in key.lower():
-                task_meta = tmeta
-                break
+        if hasattr(meta, 'values'):
+            for tmeta in meta.values():
+                if hasattr(tmeta, 'objects') and tmeta.objects:
+                    task_meta = tmeta
+                    break
         
-        if not task_meta or not hasattr(task_meta, 'objects'):
+        if not task_meta:
             return None
         
         # Extract keypoints from first detection (single person rowing)
         objects = task_meta.objects
-        if not objects or len(objects) == 0:
+        if not objects:
             return None
         
         detection = objects[0]
-        if not isinstance(detection, KeypointObjectWithBbox):
+        if not hasattr(detection, 'keypoints'):
             return None
         
-        # Extract rowing-specific keypoints
+        # Extract rowing-specific keypoints (optimized - minimal allocations)
         keypoints_data = []
-        velocities_data = []
+        phase = self.current_phase
+        keypoints = detection.keypoints
         
-        for kp_name in self.ROWING_KEYPOINTS:
-            kp_idx = self.COCO_KEYPOINT_MAP.get(kp_name)
-            if kp_idx is None or kp_idx >= len(detection.keypoints):
-                continue
-            
-            kp = detection.keypoints[kp_idx]
-            if len(kp) < 2:
-                continue
-            
-            # Keypoint coordinates (already denormalized by SDK)
-            x, y = kp[0], kp[1]
-            confidence = kp[2] if len(kp) > 2 else 1.0
-            
-            keypoints_data.append({
-                "name": kp_name,
-                "x": int(x),
-                "y": int(y),
-                "confidence": float(confidence),
-                "phase": self.current_phase
-            })
-            
-            # Velocity data (if available from Kalman filtering)
-            # Note: Axelera SDK doesn't expose velocity directly in Python yet
-            # This would require C++ integration or velocity calculation in Python
-            # velocities_data.append({
-            #     "name": kp_name,
-            #     "vx": 0.0,  # TODO: Extract from C++ Kalman filter
-            #     "vy": 0.0,
-            #     "speed": 0.0
-            # })
+        # Unrolled loop for max speed - direct indices [6, 12, 14, 16, 10]
+        if 6 < len(keypoints) and len(keypoints[6]) >= 2:
+            kp = keypoints[6]
+            keypoints_data.append({"name": "right_shoulder", "x": int(kp[0]), "y": int(kp[1]), 
+                                   "confidence": kp[2] if len(kp) > 2 else 1.0, "phase": phase})
+        if 12 < len(keypoints) and len(keypoints[12]) >= 2:
+            kp = keypoints[12]
+            keypoints_data.append({"name": "right_hip", "x": int(kp[0]), "y": int(kp[1]), 
+                                   "confidence": kp[2] if len(kp) > 2 else 1.0, "phase": phase})
+        if 14 < len(keypoints) and len(keypoints[14]) >= 2:
+            kp = keypoints[14]
+            keypoints_data.append({"name": "right_knee", "x": int(kp[0]), "y": int(kp[1]), 
+                                   "confidence": kp[2] if len(kp) > 2 else 1.0, "phase": phase})
+        if 16 < len(keypoints) and len(keypoints[16]) >= 2:
+            kp = keypoints[16]
+            keypoints_data.append({"name": "right_ankle", "x": int(kp[0]), "y": int(kp[1]), 
+                                   "confidence": kp[2] if len(kp) > 2 else 1.0, "phase": phase})
+        if 10 < len(keypoints) and len(keypoints[10]) >= 2:
+            kp = keypoints[10]
+            keypoints_data.append({"name": "right_wrist", "x": int(kp[0]), "y": int(kp[1]), 
+                                   "confidence": kp[2] if len(kp) > 2 else 1.0, "phase": phase})
         
         if not keypoints_data:
             return None
@@ -182,8 +178,7 @@ class KeypointRecorder:
             frame_number=frame_number,
             timestamp=timestamp,
             phase=self.current_phase,
-            keypoints=keypoints_data,
-            velocities=velocities_data
+            keypoints=keypoints_data
         )
     
     def add_frame(self, frame_data: Optional[FrameKeypointData]):
@@ -193,38 +188,42 @@ class KeypointRecorder:
         Args:
             frame_data: Keypoint data for current frame (None if no detections)
         """
-        self.frame_count += 1
-        
         if frame_data is None:
             return
+        
+        self.frame_count += 1
         
         # Always maintain circular buffer (last N frames)
         self.keypoint_buffer.append(frame_data)
         
-        # Phase-based event collection (similar to rowing stroke detection)
-        # Phase 2 = "drive" phase in rowing ergometer
-        if self.current_phase == 2:  # Drive phase
+        # Phase-based event collection - only process if phase is relevant
+        phase = self.current_phase
+        if phase == 2:  # Drive phase
             if not self.event_active:
                 # Event just started - copy buffer to storage (N frames before event)
                 self.event_active = True
                 self.event_keypoints = list(self.keypoint_buffer)
                 self.post_event_count = 0
-                LOG.info(f"Event started at frame {frame_data.frame_number} (phase {self.current_phase})")
             else:
                 # Continue collecting during event
                 self.event_keypoints.append(frame_data)
         
-        elif self.event_active and self.current_phase in (3, 4):  # Post-event phases (dwelling, recovery)
-            # Collect N frames after event ends
-            if self.post_event_count < self.buffer_size:
-                self.event_keypoints.append(frame_data)
-                self.post_event_count += 1
-            else:
-                # Event complete - queue for save
-                self._queue_save()
-                self.event_active = False
-                self.post_event_count = 0
-                self.event_keypoints = []
+        elif self.event_active:
+            if phase in (3, 4):  # Post-event phases (dwelling, recovery)
+                # Collect N frames after event ends
+                if self.post_event_count < self.buffer_size:
+                    self.event_keypoints.append(frame_data)
+                    self.post_event_count += 1
+                else:
+                    # Event complete - queue for save
+                    self._queue_save()
+                    self.event_active = False
+                    self.post_event_count = 0
+                    self.event_keypoints = []
+                    
+                    # Clear force data after saving stroke
+                    if self.phase_controller is not None:
+                        self.phase_controller.clear_force_data()
     
     def set_phase(self, phase: int):
         """
@@ -255,7 +254,7 @@ class KeypointRecorder:
     def _queue_save(self, additional_data: Optional[Dict[str, Any]] = None):
         """Queue event data for async save"""
         timestamp = int(time.time())
-        filename = os.path.join(self.save_dir, f"stroke_{timestamp}.json.gz")
+        filename = os.path.join(self.save_dir, f"stroke_{timestamp}.json")
         
         # Structure data as JSON
         data = {
@@ -264,11 +263,14 @@ class KeypointRecorder:
             "keypoints": [
                 [kp for kp in frame.keypoints] for frame in self.event_keypoints
             ],
-            "velocities": [
-                [v for v in frame.velocities] for frame in self.event_keypoints
-            ],
             "phases": [frame.phase for frame in self.event_keypoints]
         }
+        
+        # Add force data if available from phase controller
+        if self.phase_controller is not None:
+            force_data = self.phase_controller.get_force_data()
+            if force_data:
+                data['force'] = force_data
         
         # Merge additional data (e.g., force measurements)
         if additional_data:
@@ -278,12 +280,14 @@ class KeypointRecorder:
         with self.save_queue_lock:
             self.save_queue.append((data, filename))
         
-        LOG.info(f"Queued event save: {len(self.event_keypoints)} frames -> {filename}")
+        # Use debug level to avoid I/O overhead
+        LOG.debug(f"Queued event save: {len(self.event_keypoints)} frames -> {filename}")
     
     def _save_worker(self):
         """Background worker thread for async saves"""
         while True:
-            time.sleep(0.1)  # Check queue every 100ms
+            # Block until work is available instead of polling
+            time.sleep(0.5)  # Reduced polling frequency to minimize GIL contention
             
             with self.save_queue_lock:
                 if not self.save_queue:
@@ -292,11 +296,12 @@ class KeypointRecorder:
                 data, filename = self.save_queue.popleft()
             
             try:
-                # GIL is released during gzip compression and I/O
-                with gzip.open(filename, 'wt', compresslevel=3) as f:
+                # Save as plain JSON (no compression for max speed)
+                with open(filename, 'w') as f:
                     json.dump(data, f, separators=(',', ':'))
                 self.events_saved += 1
-                LOG.info(f"Saved event {self.events_saved} to {filename}")
+                # Use debug level to avoid I/O overhead
+                LOG.debug(f"Saved event {self.events_saved} to {filename}")
             except Exception as e:
                 LOG.error(f"Error saving event: {e}")
     

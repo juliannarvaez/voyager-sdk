@@ -23,8 +23,12 @@ from usb import USBError
 
 try:
     from .csafe import csafe_cmd  # Relative import for package use
-except ImportError:
-    from csafe import csafe_cmd  # Direct import for script use
+except (ImportError, ValueError):
+    try:
+        from csafe import csafe_cmd  # Direct import for script use
+    except ImportError:
+        # Fallback for when csafe module isn't needed
+        csafe_cmd = None
 
 C2_VENDOR_ID = 0x17a4
 MIN_FRAME_GAP = .100 # 100ms for PM5 firmware 459+ (spec is 50ms minimum)

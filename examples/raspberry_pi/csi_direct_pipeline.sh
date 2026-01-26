@@ -44,9 +44,11 @@ rpicam-vid \
   --flush \
   --hflip \
   --awb auto \
-  --ev 2.5 \
-  --brightness 0.1 \
-  --contrast 1.1 \
+  --ev 1.0 \
+  --brightness 0.2 \
+  --contrast 1.05 \
+  --saturation 1.0 \
+  --metering average \
   -o - | \
 gst-launch-1.0 -e \
   fdsrc do-timestamp=true ! \

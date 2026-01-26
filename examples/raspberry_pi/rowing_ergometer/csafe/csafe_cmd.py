@@ -6,7 +6,10 @@
 # Please report and findings to the author so that they may be addressed in a stable release.
 
 from warnings import warn
-from pyrow.csafe import csafe_dic
+try:
+    from . import csafe_dic  # Relative import for package use
+except ImportError:
+    import csafe_dic  # Direct import for script use
 
 def __int2bytes(numbytes, integer):
     if not 0 <= integer <= 2 ** (8 * numbytes):
