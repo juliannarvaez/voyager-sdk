@@ -64,13 +64,36 @@ def create_erg_phase_callback():
         time.sleep(3.0)
         
         def get_phase():
-            """Get current stroke phase from PM5"""
+            """Get current stroke phase and force data from PM5"""
             try:
-                forceplot = erg.get_forceplot()
-                return forceplot.get('strokestate', 0) if forceplot else 0
+                forceplot = erg.get_forceplot()  # Uses default 32 samples
+                phase = forceplot.get('strokestate', 0) if forceplot else 0
+                force_curve = forceplot.get('forceplot', []) if forceplot else []
+                
+                # Detailed debug logging
+                if forceplot:
+                    status = forceplot.get('status', -1)
+                    
+                    # Log raw response for debugging
+                    if len(force_curve) > 0:
+                        LOG.info(f"PM5 FORCE DATA: {len(force_curve)} samples, phase={phase}, status={status}")
+                        LOG.info(f"  Force values: {force_curve[:10]}...")  # First 10 values
+                    else:
+                        # Log why force data is empty
+                        LOG.debug(f"PM5: phase={phase}, force=EMPTY, status={status}")
+                else:
+                    LOG.warning("PM5 returned empty forceplot response")
+                
+                # Return dict with both phase and force data
+                return {
+                    'phase': phase,
+                    'force': force_curve
+                }
             except Exception as e:
                 LOG.error(f"Error reading ergometer phase: {e}")
-                return 0
+                import traceback
+                LOG.error(traceback.format_exc())
+                return {'phase': 0, 'force': []}
         
         return get_phase
         
@@ -105,6 +128,9 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
     frame_number = 0
     last_stats_time = time.time()
     stats_interval = 5.0  # Log stats every 5 seconds
+    last_phase_update = 0
+    phase_update_interval = 0.1  # Check cached phase every 100ms (no USB I/O)
+    width, height = 0, 0  # Cache dimensions
     
     LOG.info("Starting inference loop with keypoint recording...")
     LOG.info(f"Recorder: buffer_size={recorder.buffer_size}, save_dir={recorder.save_dir}")
@@ -119,7 +145,6 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
         disable=None,
     ):
         if not event.result:
-            LOG.warning(f"Unknown event received: {event!r}")
             continue
         
         frame_result = event.result
@@ -132,36 +157,28 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
                 break
             continue
         
-        # Update phase from ergometer
-        controller.update_phase_from_external()
+        # Update phase from cached ergometer value (fast - no USB I/O)
+        if now - last_phase_update > phase_update_interval:
+            controller.update_phase_from_external()
+            last_phase_update = now
         
-        # Extract and record keypoint data
-        if meta:
-            try:
-                # Extract video dimensions
-                height, width = image.shape[:2] if image is not None else (0, 0)
-                
-                # Extract keypoint data from meta
-                frame_data = recorder.extract_keypoints_from_meta(
-                    meta, width, height, frame_number, now
-                )
-                
-                # Add to recorder (handles buffering and event detection)
+        # Extract and record keypoint data (only if meta exists)
+        if meta and width > 0:
+            frame_data = recorder.extract_keypoints_from_meta(meta, width, height, frame_number, now)
+            if frame_data:
                 recorder.add_frame(frame_data)
-                
-                # Log detection info
-                if frame_data and frame_number % 30 == 0:
-                    num_kpts = len(frame_data.keypoints)
-                    LOG.debug(f"Frame {frame_number}: {num_kpts} keypoints detected, phase={controller.get_phase_name()}")
-                
-            except Exception as e:
-                LOG.error(f"Error in keypoint recording (frame {frame_number}): {e}")
+        elif meta and image is not None:
+            # First frame - get dimensions
+            if hasattr(image, 'shape'):
+                height, width = image.shape[:2]
+            else:
+                width, height = image.size
         
-        # Display frame with annotations
+        # Display frame
         if image:
             wnd.show(image, meta, frame_result.stream_id)
         
-        # Periodic stats logging
+        # Periodic stats logging (reduced frequency)
         if now - last_stats_time > stats_interval:
             stats = recorder.get_stats()
             LOG.info(
@@ -226,7 +243,7 @@ def main():
     
     # Create inference stream
     try:
-        tracers = inf_tracers.creaPM5 ergometer via USB and ensure it's powered on
+        tracers = inf_tracers.create_tracers_from_args(args)
         stream = create_inference_stream(
             config.SystemConfig.from_parsed_args(args),
             config.InferenceStreamConfig.from_parsed_args(args),
@@ -252,8 +269,14 @@ def main():
     except KeyboardInterrupt:
         LOG.info("Recording stopped by user")
     except Exception as e:
+        import traceback
+        LOG.error(f"Error during recording: {e}")
+        LOG.error(traceback.format_exc())
         LOG.exit_with_error_log(e)
     finally:
+        # Stop background USB polling thread
+        controller.stop()
+        
         if 'stream' in locals():
             stream.stop()
         
