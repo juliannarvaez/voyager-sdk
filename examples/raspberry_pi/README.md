@@ -75,30 +75,106 @@ Adjust the script parameters based on your needs and model requirements.
 
 ## Recording Keypoint Data
 
-### Transfer record_keypoints.py to Docker
+### Simple Keypoint Recording
 
-The `record_keypoints.py` script records keypoint detection data with frame timing for analysis:
+The `record_keypoints.py` script records keypoint detection data with frame timing for analysis.
 
-```bash
-# From host - copy script to Docker container
-docker cp examples/raspberry_pi/record_keypoints.py voyager-sdk-1.5.3:/voyager-sdk/record_keypoints.py
-```
-
-### Run Keypoint Recording
+Files are already in the Docker container at `/voyager-sdk/examples/raspberry_pi/`.
 
 ```bash
-# In Docker
+# In Docker container
 docker exec -it voyager-sdk-1.5.3 /bin/bash
-cd /voyager-sdk
-source venv/bin/activate
+cd /voyager-sdk/examples/raspberry_pi
+source ../../venv/bin/activate
 
 # Record keypoint data (saves to /tmp by default - accessible on host)
-AXELERA_CONFIGURE_BOARD=,20 ./record_keypoints.py yolov8mpose-coco usb:10/yuyv --max-frames 300
+AXELERA_CONFIGURE_BOARD=,20 python record_keypoints.py \
+  --network yolov8mpose-coco \
+  --source usb:10/yuyv \
+  --max-frames 300
 
 # Or specify custom output directory in /tmp
-AXELERA_CONFIGURE_BOARD=,20 ./record_keypoints.py yolov8mpose-coco usb:10/yuyv \
+AXELERA_CONFIGURE_BOARD=,20 python record_keypoints.py \
+  --network yolov8mpose-coco \
+  --source usb:10/yuyv \
   --record-dir /tmp/my_keypoints \
   --max-frames 300
+```
+
+### Rowing Ergometer Stroke Recording
+
+The `rowing_ergometer_recording.py` script integrates with Concept2 PM5 ergometers for automatic stroke phase detection and event-based keypoint capture.
+
+**Features:**
+- Automatic phase detection from PM5 (no manual control needed)
+- Circular buffering captures 30 frames before/after each stroke
+- Event-based recording triggered by drive phase
+- Gzipped JSON output compatible with cameraerg analysis tools
+
+**Prerequisites:**
+1. Concept2 PM5 ergometer connected via USB
+2. Install pyusb in container:
+   ```bash
+   docker exec -it voyager-sdk-1.5.3 /bin/bash
+   source venv/bin/activate
+   pip install pyusb
+   ```
+
+**Run Recording:**
+```bash
+# In Docker container
+cd /voyager-sdk/examples/raspberry_pi
+source ../../venv/bin/activate
+
+# Basic usage (saves to /tmp/stroke_data)
+AXELERA_CONFIGURE_BOARD=,20 python rowing_ergometer_recording.py \
+  --network yolov8n-pose-coco \
+  --source usb:10/yuyv
+
+# With custom buffer size and save directory
+AXELERA_CONFIGURE_BOARD=,20 python rowing_ergometer_recording.py \
+  --network yolov8n-pose-coco \
+  --source usb:10/yuyv \
+  --keypoint-buffer-size 60 \
+  --keypoint-save-dir /tmp/rowing_strokes
+```
+
+**Module Structure:**
+```
+examples/raspberry_pi/
+├── rowing_ergometer/              # Recording module
+│   ├── __init__.py
+│   ├── keypoint_recorder.py       # Circular buffer & event capture
+│   ├── phase_controller.py        # PM5 phase detection
+│   └── pyrow/                     # PM5 USB communication (from cameraerg)
+│       ├── pyrow.py
+│       └── csafe/                 # CSAFE protocol
+├── rowing_ergometer_recording.py  # Main recording script
+└── analyze_strokes.py             # Data analysis tool
+```
+
+**Analyze Recorded Strokes:**
+```bash
+# In Docker or on host (data in /tmp)
+python examples/raspberry_pi/analyze_strokes.py /tmp/stroke_data/stroke_*.json.gz
+```
+
+**Troubleshooting PM5 Connection:**
+```bash
+# Check USB connection
+lsusb | grep -i concept
+
+# Test PM5 communication in Python
+docker exec -it voyager-sdk-1.5.3 /bin/bash
+source venv/bin/activate
+python3 << 'EOF'
+from examples.raspberry_pi.rowing_ergometer.pyrow import pyrow
+ergs = list(pyrow.find())
+print(f"Found {len(ergs)} ergometer(s)")
+if ergs:
+    erg = pyrow.PyErg(ergs[0])
+    print(f"Connected: {ergs[0]}")
+EOF
 ```
 
 ### Where Docker Stores Files
@@ -107,7 +183,7 @@ AXELERA_CONFIGURE_BOARD=,20 ./record_keypoints.py yolov8mpose-coco usb:10/yuyv \
 - `/tmp` → `/tmp` (read/write, **recommended for data output**)
 - `/run` → `/run` (read/write)
 - `/lib/modules` → `/lib/modules` (read-only)
-- `/dev` → `/dev` (devices, including video devices)
+- `/dev` → `/dev` (devices, including video and USB devices)
 
 **Container-only directories (NOT accessible from host):**
 - `/voyager-sdk` (SDK files, isolated)
@@ -116,19 +192,22 @@ AXELERA_CONFIGURE_BOARD=,20 ./record_keypoints.py yolov8mpose-coco usb:10/yuyv \
 **Best practices:**
 - **Save data to `/tmp`** for immediate host access without copying
 - Data saved to `/voyager-sdk` or `/home/julian` inside container requires `docker cp` to extract
-- Access recorded data on host: `ls /tmp/keypoint_data/`
+- Access recorded data on host: `ls /tmp/keypoint_data/` or `ls /tmp/stroke_data/`
 
-### Output Format
+### Output Formats
 
-The script creates a timestamped directory with:
+**Simple keypoint recording** creates a timestamped directory with:
 - `frame_timing.csv` - Frame-by-frame timing and FPS data
 - `keypoints_data/` - JSON files with keypoint coordinates, bounding boxes, and confidence scores for each frame
+
+**Rowing ergometer recording** saves individual stroke files:
+- `stroke_TIMESTAMP.json.gz` - Gzipped JSON with pre/during/post stroke keypoints, phases, and timestamps
 
 Example:
 ```bash
 # On host - access data immediately
-cat /tmp/keypoint_data/keypoints_20260125_232250/frame_timing.csv
-ls /tmp/keypoint_data/keypoints_20260125_232250/keypoints_data/
+ls /tmp/stroke_data/
+cat /tmp/stroke_data/stroke_1737849600.json.gz | gunzip | jq .
 ```
 
 ## Troubleshooting
