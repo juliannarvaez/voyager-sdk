@@ -63,26 +63,33 @@ def create_erg_phase_callback():
         # Give PM5 time to stabilize after USB connection
         time.sleep(3.0)
         
+        # Initialize workout - CRITICAL for force data collection!
+        # PM5 only provides force plot data during an active workout
+        try:
+            erg.set_workout(distance=2000, split=100, pace=120)
+            LOG.info("Workout initialized: 2000m, split=100m, pace=120s - force data now enabled")
+        except Exception as e:
+            LOG.warning(f"Could not set workout programmatically: {e}")
+            LOG.warning("Please start a workout manually on the PM5 for force data collection")
+        
         def get_phase():
             """Get current stroke phase and force data from PM5"""
             try:
-                forceplot = erg.get_forceplot()  # Uses default 32 samples
-                phase = forceplot.get('strokestate', 0) if forceplot else 0
-                force_curve = forceplot.get('forceplot', []) if forceplot else []
+                # First, get stroke state to know current phase
+                stroke_result = erg.send(['CSAFE_PM_GET_STROKESTATE'])
+                phase = stroke_result.get('CSAFE_PM_GET_STROKESTATE', [0])[0]
                 
-                # Detailed debug logging
-                if forceplot:
-                    status = forceplot.get('status', -1)
+                # Only request force data during Drive phase (matches cameraerg)
+                force_curve = []
+                if phase == 2:  # Drive phase
+                    forceplot = erg.get_forceplot()
+                    force_curve = forceplot.get('forceplot', []) if forceplot else []
                     
-                    # Log raw response for debugging
-                    if len(force_curve) > 0:
-                        LOG.info(f"PM5 FORCE DATA: {len(force_curve)} samples, phase={phase}, status={status}")
-                        LOG.info(f"  Force values: {force_curve[:10]}...")  # First 10 values
+                    if force_curve:
+                        LOG.info("Drive phase: collected %d force samples", len(force_curve))
+                        LOG.info("Force samples: %s", force_curve[:5])
                     else:
-                        # Log why force data is empty
-                        LOG.debug(f"PM5: phase={phase}, force=EMPTY, status={status}")
-                else:
-                    LOG.warning("PM5 returned empty forceplot response")
+                        LOG.debug("Drive phase but no force data returned")
                 
                 # Return dict with both phase and force data
                 return {
@@ -160,6 +167,8 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
         # Update phase from cached ergometer value (fast - no USB I/O)
         if now - last_phase_update > phase_update_interval:
             controller.update_phase_from_external()
+            # Sync phase to recorder for event triggering
+            recorder.set_phase(controller.current_phase)
             last_phase_update = now
         
         # Extract and record keypoint data (only if meta exists)
@@ -167,6 +176,8 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
             frame_data = recorder.extract_keypoints_from_meta(meta, width, height, frame_number, now)
             if frame_data:
                 recorder.add_frame(frame_data)
+            elif frame_number % 100 == 0:  # Log every 100 frames if no keypoints
+                LOG.warning(f"Frame {frame_number}: No keypoints detected in meta")
         elif meta and image is not None:
             # First frame - get dimensions
             if hasattr(image, 'shape'):

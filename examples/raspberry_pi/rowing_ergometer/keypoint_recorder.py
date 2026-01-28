@@ -10,6 +10,7 @@ Provides circular buffering, phase-based event capture, and async data saving.
 import json
 import gzip
 import os
+import sys
 import time
 import threading
 from collections import deque
@@ -89,6 +90,10 @@ class KeypointRecorder:
         # Reference to phase controller (for force data)
         self.phase_controller = None
         
+        # Force curve data from monitor thread
+        self.force_curve = []
+        self.force_curve_lock = threading.Lock()
+        
         # Circular buffers (auto-pruning with maxlen)
         self.keypoint_buffer = deque(maxlen=buffer_size)
         
@@ -146,6 +151,7 @@ class KeypointRecorder:
         
         # Extract rowing-specific keypoints (optimized - minimal allocations)
         keypoints_data = []
+        # Use current_phase that was set by set_phase()
         phase = self.current_phase
         keypoints = detection.keypoints
         
@@ -204,26 +210,30 @@ class KeypointRecorder:
                 self.event_active = True
                 self.event_keypoints = list(self.keypoint_buffer)
                 self.post_event_count = 0
+                print(f"\n*** STROKE EVENT STARTED - buffered {len(self.event_keypoints)} frames ***")
+                sys.stdout.flush()
+                LOG.info(f"Stroke event started - buffered {len(self.event_keypoints)} pre-drive frames")
             else:
                 # Continue collecting during event
                 self.event_keypoints.append(frame_data)
         
         elif self.event_active:
-            if phase in (3, 4):  # Post-event phases (dwelling, recovery)
-                # Collect N frames after event ends
-                if self.post_event_count < self.buffer_size:
-                    self.event_keypoints.append(frame_data)
-                    self.post_event_count += 1
-                else:
-                    # Event complete - queue for save
-                    self._queue_save()
-                    self.event_active = False
-                    self.post_event_count = 0
-                    self.event_keypoints = []
-                    
-                    # Clear force data after saving stroke
-                    if self.phase_controller is not None:
-                        self.phase_controller.clear_force_data()
+            # Any non-drive phase after drive = post-event (dwelling, recovery, or back to idle)
+            # Collect N frames after event ends
+            if self.post_event_count < self.buffer_size:
+                self.event_keypoints.append(frame_data)
+                self.post_event_count += 1
+                if self.post_event_count % 10 == 0:  # Log every 10 frames
+                    LOG.debug(f"Post-event collection: {self.post_event_count}/{self.buffer_size} frames")
+            else:
+                # Event complete - queue for save
+                print(f"\n*** STROKE EVENT COMPLETE - saving {len(self.event_keypoints)} frames ***")
+                sys.stdout.flush()
+                LOG.info(f"Stroke event complete - saving {len(self.event_keypoints)} total frames")
+                self._queue_save()
+                self.event_active = False
+                self.post_event_count = 0
+                self.event_keypoints = []
     
     def set_phase(self, phase: int):
         """
@@ -233,8 +243,35 @@ class KeypointRecorder:
             phase: Phase number (0: idle, 1: prep, 2: drive/event, 3: dwelling, 4: recovery)
         """
         if phase != self.current_phase:
-            LOG.debug(f"Phase transition: {self.current_phase} -> {phase}")
+            old_phase = self.current_phase
             self.current_phase = phase
+            LOG.debug(f"Recorder phase transition: {old_phase} -> {phase} (event_active={self.event_active}, post_count={self.post_event_count})")
+    
+    def set_force_curve(self, force_data: List[int]):
+        """
+        Set force curve data from monitor thread.
+        
+        Args:
+            force_data: List of force samples from PM5
+        """
+        with self.force_curve_lock:
+            self.force_curve = force_data.copy()
+    
+    def get_force_data(self) -> List[int]:
+        """
+        Get force curve data (thread-safe) and clear it.
+        
+        Returns:
+            List of force samples
+        """
+        with self.force_curve_lock:
+            data = self.force_curve.copy()
+            return data
+    
+    def clear_force_data(self):
+        """Clear stored force data."""
+        with self.force_curve_lock:
+            self.force_curve.clear()
     
     def manual_save(self, additional_data: Optional[Dict[str, Any]] = None):
         """
@@ -256,6 +293,9 @@ class KeypointRecorder:
         timestamp = int(time.time())
         filename = os.path.join(self.save_dir, f"stroke_{timestamp}.json")
         
+        print(f"\n*** _queue_save called - preparing to save to {filename} ***")
+        sys.stdout.flush()
+        
         # Structure data as JSON
         data = {
             "timestamp": timestamp,
@@ -267,10 +307,18 @@ class KeypointRecorder:
         }
         
         # Add force data if available from phase controller
+        force_data = []
         if self.phase_controller is not None:
             force_data = self.phase_controller.get_force_data()
-            if force_data:
-                data['force'] = force_data
+        # Also check local force curve (set via set_force_curve)
+        if not force_data:
+            force_data = self.get_force_data()
+        
+        if force_data:
+            data['force'] = force_data
+            LOG.info(f"Saving stroke with {len(force_data)} force samples")
+        else:
+            LOG.warning("No force data available for this stroke")
         
         # Merge additional data (e.g., force measurements)
         if additional_data:
@@ -300,6 +348,8 @@ class KeypointRecorder:
                 with open(filename, 'w') as f:
                     json.dump(data, f, separators=(',', ':'))
                 self.events_saved += 1
+                print(f"\n*** FILE SAVED: {filename} (event #{self.events_saved}) ***")
+                sys.stdout.flush()
                 # Use debug level to avoid I/O overhead
                 LOG.debug(f"Saved event {self.events_saved} to {filename}")
             except Exception as e:
