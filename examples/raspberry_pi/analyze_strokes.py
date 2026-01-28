@@ -39,9 +39,23 @@ current_index = [0]
 
 
 def compute_angle(a, b, c):
-    """Compute angle at point b formed by a-b-c."""
-    v1 = np.array([a['x'] - b['x'], a['y'] - b['y']])
-    v2 = np.array([c['x'] - b['x'], c['y'] - b['y']])
+    """Compute angle at point b formed by a-b-c.
+    
+    Args:
+        a, b, c: Tuples of (x, y) coordinates or dicts with 'x' and 'y' keys
+    """
+    # Handle both tuple and dict formats
+    if isinstance(a, tuple):
+        ax, ay = a
+        bx, by = b
+        cx, cy = c
+    else:
+        ax, ay = a['x'], a['y']
+        bx, by = b['x'], b['y']
+        cx, cy = c['x'], c['y']
+    
+    v1 = np.array([ax - bx, ay - by])
+    v2 = np.array([cx - bx, cy - by])
     norm1 = np.linalg.norm(v1)
     norm2 = np.linalg.norm(v2)
     if norm1 == 0 or norm2 == 0:
@@ -73,6 +87,26 @@ def moving_average(data, window_size=3):
             result[i] = np.nanmean(window_data)
     
     return result
+
+
+def compute_velocity(positions, fps=90):
+    """Compute velocity from position data.
+    
+    Args:
+        positions: Array of position values (x or y coordinates)
+        fps: Frames per second (default 90)
+    
+    Returns:
+        Array of velocities in pixels/second
+    """
+    if len(positions) < 2:
+        return np.array([])
+    
+    # Compute finite differences
+    velocities = np.diff(positions) * fps
+    # Pad to match original length (duplicate last value)
+    velocities = np.concatenate([velocities, [velocities[-1] if len(velocities) > 0 else 0]])
+    return velocities
 
 
 def load_stroke_file(filepath: str) -> dict:
@@ -244,6 +278,22 @@ def parse_stroke_file(filepath: str):
         knee_x.append(knee_coords[0] if knee_coords else np.nan)
         ankle_x.append(ankle_coords[0] if ankle_coords else np.nan)
     
+    # Compute velocities
+    shoulder_vx = compute_velocity(shoulder_x)
+    shoulder_vy = compute_velocity(shoulder_y)
+    hip_vx = compute_velocity(hip_x)
+    hip_vy = compute_velocity(hip_y)
+    knee_vx = compute_velocity(knee_x)
+    knee_vy = compute_velocity(knee_y)
+    ankle_vx = compute_velocity(ankle_x)
+    ankle_vy = compute_velocity(ankle_y)
+    
+    # Compute speed (magnitude of velocity)
+    shoulder_speed = np.sqrt(shoulder_vx**2 + shoulder_vy**2)
+    hip_speed = np.sqrt(hip_vx**2 + hip_vy**2)
+    knee_speed = np.sqrt(knee_vx**2 + knee_vy**2)
+    ankle_speed = np.sqrt(ankle_vx**2 + ankle_vy**2)
+    
     return {
         'knee_angles': np.array(knee_angles),
         'hip_angles': np.array(hip_angles),
@@ -255,12 +305,32 @@ def parse_stroke_file(filepath: str):
         'hip_x': np.array(hip_x),
         'knee_x': np.array(knee_x),
         'ankle_x': np.array(ankle_x),
+        'shoulder_vx': shoulder_vx,
+        'shoulder_vy': shoulder_vy,
+        'hip_vx': hip_vx,
+        'hip_vy': hip_vy,
+        'knee_vx': knee_vx,
+        'knee_vy': knee_vy,
+        'ankle_vx': ankle_vx,
+        'ankle_vy': ankle_vy,
+        'shoulder_speed': shoulder_speed,
+        'hip_speed': hip_speed,
+        'knee_speed': knee_speed,
+        'ankle_speed': ankle_speed,
         'phases': phases
     }
 
 
-def show_plot(filepath: str, current_file_idx: int, total_files: int):
-    """Show interactive plot for a single stroke."""
+def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, axes=None):
+    """Show interactive plot for a single stroke.
+    
+    Args:
+        filepath: Path to stroke JSON file
+        current_file_idx: Current stroke index
+        total_files: Total number of stroke files
+        fig: Optional existing figure to update (for smooth transitions)
+        axes: Optional existing axes to update (for smooth transitions)
+    """
     if not HAS_MATPLOTLIB:
         print("ERROR: matplotlib not available. Install with: pip3 install matplotlib")
         return None
@@ -277,10 +347,22 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int):
     hip_x = data['hip_x']
     knee_x = data['knee_x']
     ankle_x = data['ankle_x']
+    shoulder_speed = data['shoulder_speed']
+    hip_speed = data['hip_speed']
+    knee_speed = data['knee_speed']
+    ankle_speed = data['ankle_speed']
+    shoulder_vx = data['shoulder_vx']
+    hip_vx = data['hip_vx']
+    knee_vx = data['knee_vx']
+    ankle_vx = data['ankle_vx']
+    shoulder_vy = data['shoulder_vy']
+    hip_vy = data['hip_vy']
+    knee_vy = data['knee_vy']
+    ankle_vy = data['ankle_vy']
     phases = data['phases']
     
     # Apply smoothing
-    window = 3
+    window = 5
     knee_smooth = moving_average(knee_angles, window)
     hip_smooth = moving_average(hip_angles, window)
     shoulder_y_smooth = moving_average(shoulder_y, window)
@@ -291,11 +373,30 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int):
     hip_x_smooth = moving_average(hip_x, window)
     knee_x_smooth = moving_average(knee_x, window)
     ankle_x_smooth = moving_average(ankle_x, window)
+    shoulder_speed_smooth = moving_average(shoulder_speed, window)
+    hip_speed_smooth = moving_average(hip_speed, window)
+    knee_speed_smooth = moving_average(knee_speed, window)
+    ankle_speed_smooth = moving_average(ankle_speed, window)
+    shoulder_vx_smooth = moving_average(shoulder_vx, window)
+    hip_vx_smooth = moving_average(hip_vx, window)
+    knee_vx_smooth = moving_average(knee_vx, window)
+    ankle_vx_smooth = moving_average(ankle_vx, window)
+    shoulder_vy_smooth = moving_average(shoulder_vy, window)
+    hip_vy_smooth = moving_average(hip_vy, window)
+    knee_vy_smooth = moving_average(knee_vy, window)
+    ankle_vy_smooth = moving_average(ankle_vy, window)
     
     frames = np.arange(len(knee_angles))
     
-    # Create figure
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 10))
+    # Create or reuse figure with 2 subplots
+    if fig is None or axes is None:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8))
+    else:
+        ax1, ax2 = axes
+        # Clear existing content
+        ax1.clear()
+        ax2.clear()
+    
     fig.suptitle(f'Stroke Analysis [{current_file_idx + 1}/{total_files}]: {os.path.basename(filepath)}', fontsize=14)
     
     # Phase colors
@@ -308,7 +409,7 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int):
     }
     
     # Draw phase backgrounds
-    for ax in [ax1, ax2, ax3]:
+    for ax in [ax1, ax2]:
         current_phase = None
         phase_start = 0
         for i, phase in enumerate(phases + [-1]):  # Add sentinel
@@ -327,37 +428,26 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int):
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
     
-    # Plot 2: Y positions
-    ax2.plot(frames, shoulder_y_smooth, 'purple', label='Shoulder Y', linewidth=2)
-    ax2.plot(frames, hip_y_smooth, 'blue', label='Hip Y', linewidth=2)
-    ax2.plot(frames, knee_y_smooth, 'green', label='Knee Y', linewidth=2)
-    ax2.plot(frames, ankle_y_smooth, 'orange', label='Ankle Y', linewidth=2)
-    ax2.set_ylabel('Y Position (pixels)', fontsize=12)
-    ax2.set_title('Vertical Positions Over Time', fontsize=12)
+    # Plot 2: Speed (magnitude)
+    ax2.plot(frames, shoulder_speed_smooth, 'purple', label='Shoulder', linewidth=2)
+    ax2.plot(frames, hip_speed_smooth, 'blue', label='Hip', linewidth=2)
+    ax2.plot(frames, knee_speed_smooth, 'green', label='Knee', linewidth=2)
+    ax2.plot(frames, ankle_speed_smooth, 'orange', label='Ankle', linewidth=2)
+    ax2.set_xlabel('Frame', fontsize=12)
+    ax2.set_ylabel('Speed (px/s)', fontsize=12)
+    ax2.set_title('Joint Speeds (Magnitude)', fontsize=12)
     ax2.legend(loc='upper right')
     ax2.grid(True, alpha=0.3)
-    ax2.invert_yaxis()  # Invert since y=0 is at top
-    
-    # Plot 3: X positions
-    ax3.plot(frames, shoulder_x_smooth, 'purple', label='Shoulder X', linewidth=2)
-    ax3.plot(frames, hip_x_smooth, 'blue', label='Hip X', linewidth=2)
-    ax3.plot(frames, knee_x_smooth, 'green', label='Knee X', linewidth=2)
-    ax3.plot(frames, ankle_x_smooth, 'orange', label='Ankle X', linewidth=2)
-    ax3.set_xlabel('Frame', fontsize=12)
-    ax3.set_ylabel('X Position (pixels)', fontsize=12)
-    ax3.set_title('Horizontal Positions Over Time', fontsize=12)
-    ax3.legend(loc='upper right')
-    ax3.grid(True, alpha=0.3)
     
     # Highlight buffer zones (first 30 and last 30 frames)
     buffer_size = 30
-    for ax in [ax1, ax2, ax3]:
+    for ax in [ax1, ax2]:
         if len(frames) > buffer_size:
             ax.axvspan(0, buffer_size, alpha=0.1, color='gray', linestyle='--')
             ax.axvspan(len(frames) - buffer_size, len(frames), alpha=0.1, color='gray', linestyle='--')
     
     plt.tight_layout()
-    return fig
+    return fig, (ax1, ax2)
 
 
 def show_averages(files: List[str]):
@@ -407,27 +497,40 @@ def show_averages(files: List[str]):
     return fig
 
 
-def on_key(event, files: List[str], current_idx: list):
-    """Handle keyboard events for navigation."""
+def on_key(event, files: List[str], current_idx: list, fig_state: dict):
+    """Handle keyboard events for navigation.
+    
+    Args:
+        event: Keyboard event
+        files: List of stroke files
+        current_idx: List containing current index (mutable)
+        fig_state: Dict containing 'fig' and 'axes' for reuse
+    """
     if event.key == 'right' and current_idx[0] < len(files) - 1:
         current_idx[0] += 1
-        plt.close('all')
-        fig = show_plot(files[current_idx[0]], current_idx[0], len(files))
+        fig, axes = show_plot(files[current_idx[0]], current_idx[0], len(files), 
+                             fig_state.get('fig'), fig_state.get('axes'))
         if fig:
-            fig.canvas.mpl_connect('key_press_event', lambda e: on_key(e, files, current_idx))
-            plt.show()
+            fig_state['fig'] = fig
+            fig_state['axes'] = axes
+            fig.canvas.draw_idle()
+            fig.canvas.flush_events()
     elif event.key == 'left' and current_idx[0] > 0:
         current_idx[0] -= 1
-        plt.close('all')
-        fig = show_plot(files[current_idx[0]], current_idx[0], len(files))
+        fig, axes = show_plot(files[current_idx[0]], current_idx[0], len(files),
+                             fig_state.get('fig'), fig_state.get('axes'))
         if fig:
-            fig.canvas.mpl_connect('key_press_event', lambda e: on_key(e, files, current_idx))
-            plt.show()
+            fig_state['fig'] = fig
+            fig_state['axes'] = axes
+            fig.canvas.draw_idle()
+            fig.canvas.flush_events()
     elif event.key == 'a':
         plt.close('all')
         fig = show_averages(files)
         if fig:
-            fig.canvas.mpl_connect('key_press_event', lambda e: on_key(e, files, current_idx))
+            fig_state['fig'] = None  # Reset for averages view
+            fig_state['axes'] = None
+            fig.canvas.mpl_connect('key_press_event', lambda e: on_key(e, files, current_idx, fig_state))
             plt.show()
 
 
@@ -594,9 +697,12 @@ def main():
             return
         
         current_idx = [start_idx]
-        fig = show_plot(files[current_idx[0]], current_idx[0], len(files))
+        fig_state = {}  # Shared state for figure reuse
+        fig, axes = show_plot(files[current_idx[0]], current_idx[0], len(files))
         if fig:
-            fig.canvas.mpl_connect('key_press_event', lambda e: on_key(e, files, current_idx))
+            fig_state['fig'] = fig
+            fig_state['axes'] = axes
+            fig.canvas.mpl_connect('key_press_event', lambda e: on_key(e, files, current_idx, fig_state))
             print("\nKeyboard controls:")
             print("  Left/Right arrows: Navigate between strokes")
             print("  'a': Show average across all strokes")
