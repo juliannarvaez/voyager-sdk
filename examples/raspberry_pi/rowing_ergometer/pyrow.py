@@ -266,15 +266,31 @@ class PyErg(object):
         Returns force plot data and stroke state
         """
 
-        command = ['CSAFE_PM_GET_FORCEPLOTDATA', 32, 'CSAFE_PM_GET_STROKESTATE']
+        # Try requesting 64 bytes (32 samples) - PM5 may need larger request to return data
+        command = ['CSAFE_PM_GET_FORCEPLOTDATA', 64, 'CSAFE_PM_GET_STROKESTATE']
         results = self.send(command)
 
         forceplot = {}
-        datapoints = results['CSAFE_PM_GET_FORCEPLOTDATA'][0] // 2
+        byte_count = results['CSAFE_PM_GET_FORCEPLOTDATA'][0]
+        datapoints = byte_count // 2
+        
+        # DEBUG: Log raw response to understand PM5 behavior
+        if byte_count == 0:
+            print(f"DEBUG get_forceplot: byte_count=0 (PM5 buffer empty) - stroke_state={results['CSAFE_PM_GET_STROKESTATE'][0]}")
+            print(f"DEBUG get_forceplot: Full response (first 20): {results['CSAFE_PM_GET_FORCEPLOTDATA'][:20]}")
+            print(f"DEBUG get_forceplot: Command sent: {command}")
+        else:
+            print(f"DEBUG get_forceplot: byte_count={byte_count}, datapoints={datapoints}, stroke_state={results['CSAFE_PM_GET_STROKESTATE'][0]}")
+            print(f"DEBUG get_forceplot: Force samples: {results['CSAFE_PM_GET_FORCEPLOTDATA'][1:(datapoints+1)]}")
+        sys.stdout.flush()
+        
         forceplot['forceplot'] = results['CSAFE_PM_GET_FORCEPLOTDATA'][1:(datapoints+1)]
         forceplot['strokestate'] = results['CSAFE_PM_GET_STROKESTATE'][0]
 
         forceplot['status'] = results['CSAFE_GETSTATUS_CMD'][0] & 0xF
+
+        forceplot = get_pretty(forceplot, pretty)
+        return forceplot
 
         forceplot = get_pretty(forceplot, pretty)
         return forceplot

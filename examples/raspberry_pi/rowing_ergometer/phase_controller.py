@@ -56,7 +56,8 @@ class PhaseController:
         self._force_data_lock = threading.Lock()  # Protect force data access
         self._polling_thread = None
         self._stop_polling = threading.Event()
-        self._poll_interval = 0.05  # 50ms polling rate for higher sample rate
+        self._poll_interval_idle = 0.3  # 300ms polling during idle/recovery
+        self._poll_interval_drive = 0.05  # 50ms polling during Drive - catch PM5 force buffer before it clears
         self._last_phase = StrokePhase.IDLE  # Track phase transitions
         
         LOG.info("PhaseController initialized for ergometer phase detection")
@@ -80,7 +81,7 @@ class PhaseController:
                 name="ErgometerPoller"
             )
             self._polling_thread.start()
-            LOG.info(f"External phase callback registered, background USB polling started ({self._poll_interval*1000:.0f}ms interval)")
+            LOG.info(f"External phase callback registered, background USB polling started (idle={self._poll_interval_idle*1000:.0f}ms, drive={self._poll_interval_drive*1000:.0f}ms)")
     
     def _poll_ergometer_loop(self):
         """Background thread that continuously polls ergometer via USB (CSAFE request-response)"""
@@ -102,12 +103,19 @@ class PhaseController:
                         phase = result
                         force_data = []
                     
-                    # Detect drive→dwelling/recovery transition (when force data becomes available)
-                    if self._last_phase == 2 and phase in (3, 4) and len(force_data) > 0:
-                        # Capture force data for this stroke
+                    # Cache force data whenever available (PM5 returns it when ready)
+                    if len(force_data) > 0:
                         with self._force_data_lock:
-                            self._cached_force_data = list(force_data)
-                        LOG.info(f"Captured force curve: {len(force_data)} samples at phase transition 2→{phase}")
+                            # Accumulate force data during drive phase
+                            self._cached_force_data.extend(force_data)
+                            LOG.info(f"Accumulated force data: +{len(force_data)} samples, total={len(self._cached_force_data)} in phase {phase}")
+                    
+                    # Clear force cache when starting new stroke (entering drive from non-drive)
+                    if self._last_phase != 2 and phase == 2:
+                        with self._force_data_lock:
+                            if len(self._cached_force_data) > 0:
+                                LOG.info(f"New stroke started, clearing {len(self._cached_force_data)} cached samples from previous stroke")
+                            self._cached_force_data = []
                     
                     # Update cached values
                     old_phase = self._cached_phase
@@ -128,8 +136,11 @@ class PhaseController:
                 import traceback
                 LOG.error(traceback.format_exc())
             
-            # Sleep for poll interval
-            time.sleep(self._poll_interval)
+            # Adaptive polling interval: faster during Drive to catch PM5 force buffer
+            # PM5 force buffer holds ~16 samples @ 100Hz = 160ms of data
+            # Poll at 50ms during Drive to ensure we catch data before PM5 clears it
+            current_interval = self._poll_interval_drive if self._cached_phase == 2 else self._poll_interval_idle
+            time.sleep(current_interval)
         LOG.info("Ergometer USB polling thread stopped")
     
     def get_force_data(self):
