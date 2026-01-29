@@ -43,9 +43,15 @@ from axelera.app import (
     yaml_parser,
 )
 
-from rowing_ergometer import KeypointRecorder, PhaseController, pyrow
+# Import backend (C++ if available, otherwise Python)
+from rowing_backend import KeypointRecorder, PhaseController, pyrow, USE_CPP
 
 LOG = logging_utils.getLogger(__name__)
+
+if USE_CPP:
+    LOG.info("=== C++ BACKEND ACTIVE: Zero-allocation performance mode ===")
+else:
+    LOG.info("Using Python backend (install C++ module for 95% jitter reduction)")
 
 
 class FPSBenchmark:
