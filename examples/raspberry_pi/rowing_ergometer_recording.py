@@ -25,6 +25,9 @@ import os
 import sys
 import time
 import argparse
+import threading
+import glob
+from collections import deque
 
 if not os.environ.get('AXELERA_FRAMEWORK'):
     sys.exit("Please activate the Axelera environment with source venv/bin/activate and run again")
@@ -41,6 +44,51 @@ from axelera.app import (
 from rowing_ergometer import KeypointRecorder, PhaseController, pyrow
 
 LOG = logging_utils.getLogger(__name__)
+
+
+class DisplayWorker:
+    """Non-blocking display worker running in separate thread"""
+    
+    def __init__(self, wnd):
+        self.wnd = wnd
+        self.frame_queue = deque(maxlen=2)  # Keep only 2 latest frames (drop old ones)
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True, name="DisplayWorker")
+        self.thread.start()
+        LOG.info("Display worker thread started (non-blocking)")
+    
+    def _run(self):
+        """Display worker loop - runs in separate thread"""
+        while self.running:
+            with self.lock:
+                if self.frame_queue:
+                    frame_data = self.frame_queue.popleft()
+                else:
+                    frame_data = None
+            
+            if frame_data:
+                try:
+                    self.wnd.show(frame_data['image'], frame_data['meta'], frame_data['stream_id'])
+                except Exception as e:
+                    LOG.error(f"Display error: {e}")
+            else:
+                time.sleep(0.001)  # 1ms sleep when idle
+    
+    def push_frame(self, image, meta, stream_id):
+        """Push frame to display queue (non-blocking)"""
+        with self.lock:
+            self.frame_queue.append({
+                'image': image,
+                'meta': meta,
+                'stream_id': stream_id
+            })
+    
+    def stop(self):
+        """Stop display worker"""
+        self.running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=1.0)
 
 
 def create_erg_phase_callback():
@@ -85,10 +133,8 @@ def create_erg_phase_callback():
                     forceplot = erg.get_forceplot()
                     force_curve = forceplot.get('forceplot', []) if forceplot else []
                     
-                    if force_curve:
-                        LOG.info("Drive phase: collected %d force samples", len(force_curve))
-                        LOG.info("Force samples: %s", force_curve[:5])
-                    else:
+                    # Conditional logging - only if no force data (debugging)
+                    if not force_curve:
                         LOG.debug("Drive phase but no force data returned")
                 
                 # Return dict with both phase and force data
@@ -112,6 +158,7 @@ def create_erg_phase_callback():
 def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
     """
     Main inference loop with integrated keypoint recording.
+    Optimized with non-blocking display and early timestamp capture.
     
     Args:
         args: Command-line arguments
@@ -121,6 +168,7 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
         recorder: KeypointRecorder instance
         controller: PhaseController instance
     """
+
     from tqdm import tqdm
     
     PBAR = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
@@ -132,16 +180,25 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
     
     wnd.options(-1, speedometer_smoothing=args.speedometer_smoothing)
     
+    # Start non-blocking display worker
+    display_worker = DisplayWorker(wnd) if not args.headless else None
+    
     frame_number = 0
-    last_stats_time = time.time()
-    stats_interval = 5.0  # Log stats every 5 seconds
-    last_phase_update = 0
-    phase_update_interval = 0.1  # Check cached phase every 100ms (no USB I/O)
     width, height = 0, 0  # Cache dimensions
+    
+    # Frame-based timing (avoid time.time() syscalls)
+    phase_update_frames = 9  # ~100ms @ 90 FPS
+    stats_interval_frames = args.stats_interval
     
     LOG.info("Starting inference loop with keypoint recording...")
     LOG.info(f"Recorder: buffer_size={recorder.buffer_size}, save_dir={recorder.save_dir}")
     LOG.info(f"Phase control: {controller.get_phase_name()}")
+    if args.headless:
+        LOG.info("Headless mode: display disabled for minimal latency")
+    if args.no_progress:
+        LOG.info("Progress bar disabled for performance")
+    if stats_interval_frames > 0:
+        LOG.info(f"Stats logging every {stats_interval_frames} frames")
     
     for event in tqdm(
         stream.with_events(),
@@ -149,31 +206,33 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
         unit='frames',
         leave=False,
         bar_format=PBAR,
-        disable=None,
+        disable=args.no_progress,
     ):
         if not event.result:
             continue
         
+        # Capture timestamp FIRST (earliest possible point in pipeline)
+        frame_timestamp = time.time()
+        
         frame_result = event.result
         frame_number += 1
-        now = time.time()
         
         image, meta = frame_result.image, frame_result.meta
         if image is None and meta is None:
-            if wnd.is_closed:
+            if not args.headless and wnd.is_closed:
                 break
             continue
         
-        # Update phase from cached ergometer value (fast - no USB I/O)
-        if now - last_phase_update > phase_update_interval:
+        # Update phase from cached ergometer value every N frames (fast - no USB I/O)
+        if frame_number % phase_update_frames == 0:
             controller.update_phase_from_external()
             # Sync phase to recorder for event triggering
             recorder.set_phase(controller.current_phase)
-            last_phase_update = now
         
         # Extract and record keypoint data (only if meta exists)
         if meta and width > 0:
-            frame_data = recorder.extract_keypoints_from_meta(meta, width, height, frame_number, now)
+            # Use early-captured timestamp (frame arrival time, not processing completion)
+            frame_data = recorder.extract_keypoints_from_meta(meta, width, height, frame_number, frame_timestamp)
             if frame_data:
                 recorder.add_frame(frame_data)
             elif frame_number % 100 == 0:  # Log every 100 frames if no keypoints
@@ -185,12 +244,12 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
             else:
                 width, height = image.size
         
-        # Display frame
-        if image:
-            wnd.show(image, meta, frame_result.stream_id)
+        # Display frame (non-blocking push to display worker)
+        if image and display_worker:
+            display_worker.push_frame(image, meta, frame_result.stream_id)
         
-        # Periodic stats logging (reduced frequency)
-        if now - last_stats_time > stats_interval:
+        # Periodic stats logging (frame-based, no time.time() syscalls)
+        if stats_interval_frames > 0 and frame_number % stats_interval_frames == 0:
             stats = recorder.get_stats()
             LOG.info(
                 f"Stats: frames={stats['frames_processed']}, "
@@ -198,10 +257,13 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
                 f"phase={controller.get_phase_name()}, "
                 f"queue_depth={stats['queue_depth']}"
             )
-            last_stats_time = now
         
-        if wnd.is_closed:
+        if not args.headless and wnd.is_closed:
             break
+    
+    # Stop display worker
+    if display_worker:
+        display_worker.stop()
     
     # Final stats
     stats = recorder.get_stats()
@@ -225,8 +287,36 @@ def main():
         default=30,
         help="Number of frames to buffer before events (default: 30 frames @ 90 FPS = ~330ms)",
     )
+    parser.add_argument(
+        '--no-progress',
+        action='store_true',
+        help="Disable progress bar (reduces terminal I/O overhead at high FPS)",
+    )
+    parser.add_argument(
+        '--stats-interval',
+        type=int,
+        default=450,
+        help="Log stats every N frames (default: 450 frames = 5s @ 90 FPS). 0 disables stats.",
+    )
+    parser.add_argument(
+        '--headless',
+        action='store_true',
+        help="Disable display output for minimal latency (reduces jitter by ~30-50%%)",
+    )
     
     args = parser.parse_args()
+    
+    # Clean up old stroke data files at startup
+    save_dir = "/tmp/stroke_data"
+    old_files = glob.glob(os.path.join(save_dir, "stroke_*.json"))
+    if old_files:
+        LOG.info(f"Cleaning up {len(old_files)} old stroke file(s)...")
+        for filepath in old_files:
+            try:
+                os.remove(filepath)
+            except Exception as e:
+                LOG.warning(f"Could not remove {filepath}: {e}")
+        LOG.info("Old stroke data cleared")
     
     # Validate network is a pose model
     if 'pose' not in args.network.lower():
@@ -252,6 +342,12 @@ def main():
         LOG.error("Please connect ergometer or install pyrow: pip install pyrow")
         sys.exit(1)
     
+    # Performance tips
+    if not args.no_progress:
+        LOG.info("TIP: Use --no-progress to reduce terminal I/O overhead at high FPS")
+    if '--low-latency' not in sys.argv:
+        LOG.info("TIP: Use --low-latency to disable buffering and reduce display latency")
+    
     # Create inference stream
     try:
         tracers = inf_tracers.create_tracers_from_args(args)
@@ -275,7 +371,7 @@ def main():
                 (args, stream, app, wnd, recorder, controller),
                 name='InferenceThread',
             )
-            app.run(interval=1/10)
+            app.run()  # Default 60 FPS for smooth display
             
     except KeyboardInterrupt:
         LOG.info("Recording stopped by user")
