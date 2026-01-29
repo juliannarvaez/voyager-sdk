@@ -221,6 +221,64 @@ class KeypointRecorder:
         
         LOG.info(f"KeypointRecorder initialized: buffer_size={buffer_size}, save_dir={save_dir}, Kalman filtering enabled")
     
+    def apply_kalman_to_meta(self, meta, timestamp: float):
+        """
+        Apply Kalman filtering to meta object IN-PLACE (extremely efficient).
+        Modifies keypoint positions directly - zero allocations.
+        
+        Args:
+            meta: AxMeta container to modify
+            timestamp: Current frame timestamp
+        """
+        # Calculate dt
+        dt = 0.0167
+        if self.last_timestamp is not None:
+            dt = max(0.001, timestamp - self.last_timestamp)
+        
+        # Fast path: get task meta
+        task_meta = None
+        if hasattr(meta, 'values'):
+            for tmeta in meta.values():
+                if hasattr(tmeta, 'objects') and tmeta.objects:
+                    task_meta = tmeta
+                    break
+        
+        if not task_meta or not task_meta.objects:
+            return
+        
+        detection = task_meta.objects[0]
+        if not hasattr(detection, 'keypoints'):
+            return
+        
+        keypoints = detection.keypoints
+        
+        # In-place modification: direct index access, no copies
+        # Indices: [6, 12, 14, 16, 10]
+        if 6 < len(keypoints) and len(keypoints[6]) >= 2:
+            raw = np.array([keypoints[6][0], keypoints[6][1]], dtype=np.float32)
+            smoothed = self.kalman_filters["right_shoulder"].update(raw, dt)
+            keypoints[6][0], keypoints[6][1] = smoothed[0], smoothed[1]
+        
+        if 12 < len(keypoints) and len(keypoints[12]) >= 2:
+            raw = np.array([keypoints[12][0], keypoints[12][1]], dtype=np.float32)
+            smoothed = self.kalman_filters["right_hip"].update(raw, dt)
+            keypoints[12][0], keypoints[12][1] = smoothed[0], smoothed[1]
+        
+        if 14 < len(keypoints) and len(keypoints[14]) >= 2:
+            raw = np.array([keypoints[14][0], keypoints[14][1]], dtype=np.float32)
+            smoothed = self.kalman_filters["right_knee"].update(raw, dt)
+            keypoints[14][0], keypoints[14][1] = smoothed[0], smoothed[1]
+        
+        if 16 < len(keypoints) and len(keypoints[16]) >= 2:
+            raw = np.array([keypoints[16][0], keypoints[16][1]], dtype=np.float32)
+            smoothed = self.kalman_filters["right_ankle"].update(raw, dt)
+            keypoints[16][0], keypoints[16][1] = smoothed[0], smoothed[1]
+        
+        if 10 < len(keypoints) and len(keypoints[10]) >= 2:
+            raw = np.array([keypoints[10][0], keypoints[10][1]], dtype=np.float32)
+            smoothed = self.kalman_filters["right_wrist"].update(raw, dt)
+            keypoints[10][0], keypoints[10][1] = smoothed[0], smoothed[1]
+    
     def extract_keypoints_from_meta(self, meta, width: int, height: int, frame_number: int, timestamp: float) -> Optional[FrameKeypointData]:
         """
         Extract keypoint data from Axelera AxMeta container.

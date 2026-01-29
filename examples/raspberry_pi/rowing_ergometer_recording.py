@@ -27,6 +27,7 @@ import time
 import argparse
 import threading
 import glob
+import numpy as np
 from collections import deque
 
 if not os.environ.get('AXELERA_FRAMEWORK'):
@@ -38,6 +39,7 @@ from axelera.app import (
     display,
     inf_tracers,
     logging_utils,
+    statistics,
     yaml_parser,
 )
 
@@ -46,12 +48,66 @@ from rowing_ergometer import KeypointRecorder, PhaseController, pyrow
 LOG = logging_utils.getLogger(__name__)
 
 
+class FPSBenchmark:
+    """Ultra-efficient FPS monitoring with drop detection"""
+    __slots__ = ['intervals', 'frame_count', 'start_time', 'drop_threshold', 'last_timestamp']
+    
+    def __init__(self, window_size=300, drop_threshold_ms=25.0):
+        self.intervals = deque(maxlen=window_size)
+        self.frame_count = 0
+        self.start_time = None
+        self.last_timestamp = None
+        self.drop_threshold = drop_threshold_ms / 1000.0
+    
+    def record_frame(self, timestamp):
+        """Record frame arrival"""
+        if self.start_time is None:
+            self.start_time = timestamp
+            self.last_timestamp = timestamp
+            return
+        
+        interval = timestamp - self.last_timestamp
+        self.intervals.append(interval)
+        self.last_timestamp = timestamp
+        self.frame_count += 1
+    
+    def get_stats(self):
+        """Get performance statistics (optimized with cached arrays)"""
+        if not self.intervals:
+            return None
+        
+        # Use numpy array directly from deque (avoid extra allocation)
+        intervals_arr = np.fromiter(self.intervals, dtype=np.float32, count=len(self.intervals))
+        elapsed = self.last_timestamp - self.start_time
+        
+        mean_interval = intervals_arr.mean()  # Faster than np.mean()
+        std_interval = intervals_arr.std()    # Faster than np.std()
+        min_interval = intervals_arr.min()
+        max_interval = intervals_arr.max()
+        
+        avg_fps = 1.0 / mean_interval if mean_interval > 0 else 0
+        actual_fps = self.frame_count / elapsed if elapsed > 0 else 0
+        
+        drops = (intervals_arr > self.drop_threshold).sum()  # Faster vectorized operation
+        drop_rate = drops / len(intervals_arr) * 100.0
+        
+        return {
+            'avg_fps': avg_fps,
+            'actual_fps': actual_fps,
+            'jitter_ms': std_interval * 1000,
+            'min_ms': min_interval * 1000,
+            'max_ms': max_interval * 1000,
+            'drops': int(drops),
+            'drop_rate': drop_rate,
+        }
+
+
 class DisplayWorker:
     """Non-blocking display worker running in separate thread"""
     
     def __init__(self, wnd):
         self.wnd = wnd
-        self.frame_queue = deque(maxlen=2)  # Keep only 2 latest frames (drop old ones)
+        self.frame_queue = deque(maxlen=1)  # Keep only latest frame (minimize latency)
         self.lock = threading.Lock()
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True, name="DisplayWorker")
@@ -120,12 +176,24 @@ def create_erg_phase_callback():
             LOG.warning(f"Could not set workout programmatically: {e}")
             LOG.warning("Please start a workout manually on the PM5 for force data collection")
         
+        # Track last phase for transition logging
+        last_logged_phase = [0]  # Use list for closure
+        
+        # Track last phase for transition logging
+        last_logged_phase = [0]  # Use list for closure
+        
         def get_phase():
             """Get current stroke phase and force data from PM5"""
             try:
                 # First, get stroke state to know current phase
                 stroke_result = erg.send(['CSAFE_PM_GET_STROKESTATE'])
                 phase = stroke_result.get('CSAFE_PM_GET_STROKESTATE', [0])[0]
+                
+                # Log phase transitions
+                if phase != last_logged_phase[0]:
+                    phase_names = {0: 'IDLE', 1: 'PREP', 2: 'DRIVE', 3: 'DWELLING', 4: 'RECOVERY'}
+                    LOG.info(f"Ergometer phase: {last_logged_phase[0]} -> {phase} ({phase_names.get(phase, 'UNKNOWN')})")
+                    last_logged_phase[0] = phase
                 
                 # Only request force data during Drive phase (matches cameraerg)
                 force_curve = []
@@ -155,18 +223,20 @@ def create_erg_phase_callback():
         return None
 
 
-def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
+def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorder, controller, tracers=None):
     """
     Main inference loop with integrated keypoint recording.
     Optimized with non-blocking display and early timestamp capture.
     
     Args:
         args: Command-line arguments
+        log_file_path: Path for statistics logging (from --show-stats)
         stream: Axelera inference stream
         app: Display application
         wnd: Display window
         recorder: KeypointRecorder instance
         controller: PhaseController instance
+        tracers: Inference tracers for performance monitoring
     """
 
     from tqdm import tqdm
@@ -183,11 +253,15 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
     # Start non-blocking display worker
     display_worker = DisplayWorker(wnd) if not args.headless else None
     
+    # Initialize FPS benchmark
+    fps_benchmark = FPSBenchmark()
+    
     frame_number = 0
     width, height = 0, 0  # Cache dimensions
+    frame_data = None  # Cache last frame_data for stats
     
     # Frame-based timing (avoid time.time() syscalls)
-    phase_update_frames = 9  # ~100ms @ 90 FPS
+    phase_update_frames = 15  # ~170ms @ 90 FPS (reduced callback overhead)
     stats_interval_frames = args.stats_interval
     
     LOG.info("Starting inference loop with keypoint recording...")
@@ -199,6 +273,7 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
         LOG.info("Progress bar disabled for performance")
     if stats_interval_frames > 0:
         LOG.info(f"Stats logging every {stats_interval_frames} frames")
+    LOG.info("Pipeline optimizations: reduced allocations, batched operations, cached stats")
     
     for event in tqdm(
         stream.with_events(),
@@ -213,6 +288,9 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
         
         # Capture timestamp FIRST (earliest possible point in pipeline)
         frame_timestamp = time.time()
+        
+        # Record for FPS benchmark
+        fps_benchmark.record_frame(frame_timestamp)
         
         frame_result = event.result
         frame_number += 1
@@ -244,19 +322,40 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
             else:
                 width, height = image.size
         
+        # Apply Kalman filtering to display (in-place modification, zero overhead)
+        if meta and display_worker:
+            recorder.apply_kalman_to_meta(meta, frame_timestamp)
+        
         # Display frame (non-blocking push to display worker)
         if image and display_worker:
             display_worker.push_frame(image, meta, frame_result.stream_id)
         
-        # Periodic stats logging (frame-based, no time.time() syscalls)
+        # Periodic stats logging (frame-based, deferred computation)
         if stats_interval_frames > 0 and frame_number % stats_interval_frames == 0:
+            # Compute stats off critical path (only when logging)
             stats = recorder.get_stats()
-            LOG.info(
-                f"Stats: frames={stats['frames_processed']}, "
-                f"events_saved={stats['events_saved']}, "
-                f"phase={controller.get_phase_name()}, "
-                f"queue_depth={stats['queue_depth']}"
-            )
+            has_keypoints = "✓" if frame_data else "✗"
+            fps_stats = fps_benchmark.get_stats()
+            
+            if fps_stats:
+                # Format once to reduce string operations
+                LOG.info(
+                    f"Stats: frames={stats['frames_processed']}, "
+                    f"events_saved={stats['events_saved']}, "
+                    f"phase={controller.get_phase_name()}, "
+                    f"keypoints={has_keypoints} | "
+                    f"FPS={fps_stats['actual_fps']:.1f}, "
+                    f"jitter={fps_stats['jitter_ms']:.2f}ms, "
+                    f"drops={fps_stats['drops']}({fps_stats['drop_rate']:.1f}%)"
+                )
+            else:
+                LOG.info(
+                    f"Stats: frames={stats['frames_processed']}, "
+                    f"events_saved={stats['events_saved']}, "
+                    f"phase={controller.get_phase_name()}, "
+                    f"queue_depth={stats['queue_depth']}, "
+                    f"keypoints={has_keypoints}"
+                )
         
         if not args.headless and wnd.is_closed:
             break
@@ -264,6 +363,10 @@ def inference_loop_with_recording(args, stream, app, wnd, recorder, controller):
     # Stop display worker
     if display_worker:
         display_worker.stop()
+    
+    # Print pipeline statistics if enabled
+    if log_file_path:
+        print(statistics.format_table(log_file_path, tracers))
     
     # Final stats
     stats = recorder.get_stats()
@@ -295,8 +398,8 @@ def main():
     parser.add_argument(
         '--stats-interval',
         type=int,
-        default=450,
-        help="Log stats every N frames (default: 450 frames = 5s @ 90 FPS). 0 disables stats.",
+        default=180,
+        help="Log stats every N frames (default: 180 frames = 3s @ 60 FPS). 0 disables stats.",
     )
     parser.add_argument(
         '--headless',
@@ -351,6 +454,16 @@ def main():
     # Create inference stream
     try:
         tracers = inf_tracers.create_tracers_from_args(args)
+        
+        # Initialize pipeline statistics logging if --show-stats enabled
+        log_file, log_file_path = None, None
+        if hasattr(args, 'show_stats') and args.show_stats:
+            try:
+                log_file, log_file_path = statistics.initialise_logging()
+                LOG.info("Pipeline statistics logging enabled")
+            except Exception as e:
+                LOG.warning(f"Failed to initialize statistics logging: {e}")
+        
         stream = create_inference_stream(
             config.SystemConfig.from_parsed_args(args),
             config.InferenceStreamConfig.from_parsed_args(args),
@@ -368,7 +481,7 @@ def main():
             wnd = app.create_window('Rowing Ergometer Recording', size=args.window_size)
             app.start_thread(
                 inference_loop_with_recording,
-                (args, stream, app, wnd, recorder, controller),
+                (args, log_file_path, stream, app, wnd, recorder, controller, tracers),
                 name='InferenceThread',
             )
             app.run()  # Default 60 FPS for smooth display
