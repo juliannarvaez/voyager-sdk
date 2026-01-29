@@ -89,12 +89,12 @@ def moving_average(data, window_size=3):
     return result
 
 
-def compute_velocity(positions, fps=90):
+def compute_velocity(positions, fps=60):
     """Compute velocity from position data.
     
     Args:
         positions: Array of position values (x or y coordinates)
-        fps: Frames per second (default 90)
+        fps: Frames per second (default 60, will be overridden by detected FPS)
     
     Returns:
         Array of velocities in pixels/second
@@ -224,6 +224,16 @@ def parse_stroke_file(filepath: str):
     """Parse stroke file and extract angles and positions."""
     data = load_stroke_file(filepath)
     
+    # Detect actual FPS from timestamps
+    frame_timestamps = data.get('frame_timestamps', [])
+    detected_fps = 60.0  # Default fallback
+    if len(frame_timestamps) >= 10:
+        intervals = [frame_timestamps[i+1] - frame_timestamps[i] for i in range(min(100, len(frame_timestamps)-1))]
+        valid_intervals = [x for x in intervals if x > 0]
+        if valid_intervals:
+            avg_interval = sum(valid_intervals) / len(valid_intervals)
+            detected_fps = 1.0 / avg_interval if avg_interval > 0 else 60.0
+    
     keypoints_list = data.get('keypoints', [])
     phases = data.get('phases', [])
     
@@ -238,10 +248,11 @@ def parse_stroke_file(filepath: str):
     hip_x = []
     knee_x = []
     ankle_x = []
+    timestamps = []  # Real timestamps for FPS analysis
     
     # Process each frame
     for frame_kpts in keypoints_list:
-        # Build keypoint dict for this frame
+        # Build keypoint dict for this frame (use filtered coordinates)
         kp_dict = {}
         for kp in frame_kpts:
             kp_dict[kp['name']] = (kp['x'], kp['y'])
@@ -278,21 +289,41 @@ def parse_stroke_file(filepath: str):
         knee_x.append(knee_coords[0] if knee_coords else np.nan)
         ankle_x.append(ankle_coords[0] if ankle_coords else np.nan)
     
-    # Compute velocities
-    shoulder_vx = compute_velocity(shoulder_x)
-    shoulder_vy = compute_velocity(shoulder_y)
-    hip_vx = compute_velocity(hip_x)
-    hip_vy = compute_velocity(hip_y)
-    knee_vx = compute_velocity(knee_x)
-    knee_vy = compute_velocity(knee_y)
-    ankle_vx = compute_velocity(ankle_x)
-    ankle_vy = compute_velocity(ankle_y)
+    # Compute velocities using detected FPS
+    shoulder_vx = compute_velocity(shoulder_x, detected_fps)
+    shoulder_vy = compute_velocity(shoulder_y, detected_fps)
+    hip_vx = compute_velocity(hip_x, detected_fps)
+    hip_vy = compute_velocity(hip_y, detected_fps)
+    knee_vx = compute_velocity(knee_x, detected_fps)
+    knee_vy = compute_velocity(knee_y, detected_fps)
+    ankle_vx = compute_velocity(ankle_x, detected_fps)
+    ankle_vy = compute_velocity(ankle_y, detected_fps)
     
     # Compute speed (magnitude of velocity)
     shoulder_speed = np.sqrt(shoulder_vx**2 + shoulder_vy**2)
     hip_speed = np.sqrt(hip_vx**2 + hip_vy**2)
     knee_speed = np.sqrt(knee_vx**2 + knee_vy**2)
     ankle_speed = np.sqrt(ankle_vx**2 + ankle_vy**2)
+    
+    # Calculate frame intervals and instantaneous FPS from timestamps
+    frame_intervals = []
+    instantaneous_fps = []
+    
+    # Get timestamps from data (new format with frame_timestamps field)
+    timestamps = data.get('frame_timestamps', [])
+    
+    if len(timestamps) >= 2:
+        for i in range(1, len(timestamps)):
+            interval = timestamps[i] - timestamps[i-1]
+            frame_intervals.append(interval * 1000)  # Convert to ms
+            if interval > 0:
+                instantaneous_fps.append(1.0 / interval)
+            else:
+                instantaneous_fps.append(0)
+        # Pad first frame
+        if frame_intervals:
+            frame_intervals.insert(0, frame_intervals[0])
+            instantaneous_fps.insert(0, instantaneous_fps[0])
     
     return {
         'knee_angles': np.array(knee_angles),
@@ -317,7 +348,11 @@ def parse_stroke_file(filepath: str):
         'hip_speed': hip_speed,
         'knee_speed': knee_speed,
         'ankle_speed': ankle_speed,
-        'phases': phases
+        'phases': phases,
+        'timestamps': np.array(timestamps),
+        'frame_intervals': np.array(frame_intervals),
+        'instantaneous_fps': np.array(instantaneous_fps),
+        'detected_fps': detected_fps
     }
 
 
@@ -388,14 +423,15 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     
     frames = np.arange(len(knee_angles))
     
-    # Create or reuse figure with 2 subplots
+    # Create or reuse figure with 3 subplots (added frametime)
     if fig is None or axes is None:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8))
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
     else:
-        ax1, ax2 = axes
+        ax1, ax2, ax3 = axes
         # Clear existing content
         ax1.clear()
         ax2.clear()
+        ax3.clear()
     
     fig.suptitle(f'Stroke Analysis [{current_file_idx + 1}/{total_files}]: {os.path.basename(filepath)}', fontsize=14)
     
@@ -409,7 +445,7 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     }
     
     # Draw phase backgrounds
-    for ax in [ax1, ax2]:
+    for ax in [ax1, ax2, ax3]:
         current_phase = None
         phase_start = 0
         for i, phase in enumerate(phases + [-1]):  # Add sentinel
@@ -439,18 +475,65 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     ax2.legend(loc='upper right')
     ax2.grid(True, alpha=0.3)
     
+    # Plot 3: Frame Timing
+    frame_intervals = data.get('frame_intervals', [])
+    instantaneous_fps = data.get('instantaneous_fps', [])
+    detected_fps = data.get('detected_fps', 60.0)
+    target_interval = 1000.0 / detected_fps
+    
+    if len(frame_intervals) > 0:
+        ax3_twin = ax3.twinx()
+        
+        # Frame intervals (ms)
+        interval_smooth = moving_average(frame_intervals, window)
+        ax3.plot(frames[:len(interval_smooth)], interval_smooth, 'b-', linewidth=1.5, label='Frame Interval (ms)', alpha=0.7)
+        ax3.axhline(y=target_interval, color='b', linestyle='--', linewidth=1, alpha=0.5, label=f'Target {target_interval:.2f}ms ({detected_fps:.0f} FPS)')
+        ax3.set_ylabel('Frame Interval (ms)', color='b')
+        ax3.tick_params(axis='y', labelcolor='b')
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(loc='upper left')
+        
+        # Instantaneous FPS
+        fps_smooth = moving_average(instantaneous_fps, window)
+        ax3_twin.plot(frames[:len(fps_smooth)], fps_smooth, 'r-', linewidth=1.5, label='Instantaneous FPS', alpha=0.7)
+        ax3_twin.axhline(y=detected_fps, color='r', linestyle='--', linewidth=1, alpha=0.5, label=f'Target {detected_fps:.0f} FPS')
+        ax3_twin.set_ylabel('FPS', color='r')
+        ax3_twin.tick_params(axis='y', labelcolor='r')
+        ax3_twin.set_ylim(0, 120)
+        ax3_twin.legend(loc='upper right')
+        
+        # Calculate statistics
+        avg_interval = np.mean(frame_intervals)
+        avg_fps = np.mean(instantaneous_fps[instantaneous_fps > 0]) if len(instantaneous_fps) > 0 else 0
+        jitter = np.std(frame_intervals) if len(frame_intervals) > 0 else 0
+        
+        ax3.set_title(f'Frame Timing: Avg={avg_interval:.2f}ms ({avg_fps:.1f} FPS), Jitter={jitter:.2f}ms', fontsize=10)
+    else:
+        ax3.text(0.5, 0.5, 'No timestamp data available', ha='center', va='center', transform=ax3.transAxes)
+        ax3.set_title('Frame Timing: No Data', fontsize=10)
+    
+    ax3.set_xlabel('Frame', fontsize=12)
+    ax3.grid(True, alpha=0.3)
+    
     # Highlight buffer zones (first 30 and last 30 frames)
     buffer_size = 30
-    for ax in [ax1, ax2]:
+    for ax in [ax1, ax2, ax3]:
         if len(frames) > buffer_size:
             ax.axvspan(0, buffer_size, alpha=0.1, color='gray', linestyle='--')
             ax.axvspan(len(frames) - buffer_size, len(frames), alpha=0.1, color='gray', linestyle='--')
     
     plt.tight_layout()
-    return fig, (ax1, ax2)
+    return fig, (ax1, ax2, ax3)
 
 
 def show_averages(files: List[str]):
+    """Show average stroke data across all strokes."""
+    if not HAS_MATPLOTLIB:
+        print("ERROR: matplotlib not available. Install with: pip3 install matplotlib")
+        return None
+    
+    all_knee_angles = []
+    all_hip_angles = []
     """Show average stroke data across all strokes."""
     if not HAS_MATPLOTLIB:
         print("ERROR: matplotlib not available. Install with: pip3 install matplotlib")
@@ -573,10 +656,50 @@ def print_text_summary(files: List[str], stroke_num: int = None):
                 drive_end = drive_frames[-1]
                 drive_duration = drive_end - drive_start + 1
                 
+                # Calculate FPS from timestamps if available
+                timestamps = data.get('frame_timestamps', [])
+                detected_fps = 60.0
+                if len(timestamps) >= 10:
+                    intervals = [timestamps[i+1] - timestamps[i] for i in range(min(100, len(timestamps)-1))]
+                    valid = [x for x in intervals if x > 0]
+                    if valid:
+                        detected_fps = 1.0 / (sum(valid) / len(valid))
+                
                 print(f"\nDrive phase:")
                 print(f"  Start frame: {drive_start}")
                 print(f"  End frame: {drive_end}")
-                print(f"  Duration: {drive_duration} frames (~{drive_duration * 1000 / 90:.0f}ms @ 90 FPS)")
+                print(f"  Duration: {drive_duration} frames (~{drive_duration * 1000 / detected_fps:.0f}ms @ {detected_fps:.1f} FPS)")
+        
+        # Timestamp analysis
+        # Try to get timestamps from frame_timestamps field first (new format)
+        timestamps = data.get('frame_timestamps', [])
+        
+        # Fallback to extracting from keypoints (if timestamps embedded in keypoints)
+        if not timestamps:
+            for frame_kpts in keypoints:
+                if frame_kpts and 'timestamp' in frame_kpts[0]:
+                    timestamps.append(frame_kpts[0]['timestamp'])
+        
+        if len(timestamps) >= 2:
+            intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+            avg_interval = sum(intervals) / len(intervals)
+            min_interval = min(intervals)
+            max_interval = max(intervals)
+            jitter = np.std(intervals)
+            avg_fps = 1.0 / avg_interval if avg_interval > 0 else 0
+            
+            print(f"\nFrame Timing:")
+            print(f"  Total frames with timestamps: {len(timestamps)}")
+            print(f"  Average interval: {avg_interval*1000:.2f}ms")
+            print(f"  Min interval: {min_interval*1000:.2f}ms ({1.0/min_interval:.1f} FPS)")
+            print(f"  Max interval: {max_interval*1000:.2f}ms ({1.0/max_interval:.1f} FPS)")
+            print(f"  Average FPS: {avg_fps:.1f}")
+            print(f"  Jitter (std dev): {jitter*1000:.2f}ms")
+            print(f"  Total duration: {timestamps[-1] - timestamps[0]:.2f}s")
+        else:
+            print(f"\nFrame Timing:")
+            print(f"  No timestamp data available (recorded before timestamp feature)")
+            print(f"  Estimated duration: {len(phases) / 60.0:.2f}s @ 60 FPS (assumed)")
     else:
         # Summary of all strokes
         print(f"\n{'='*70}")
@@ -684,7 +807,8 @@ def main():
         fig = show_averages(files)
         if fig:
             current_idx = [0]
-            fig.canvas.mpl_connect('key_press_event', lambda e: on_key(e, files, current_idx))
+            fig_state = {'fig': None, 'axes': None}
+            fig.canvas.mpl_connect('key_press_event', lambda e: on_key(e, files, current_idx, fig_state))
             print("\nKeyboard controls:")
             print("  Left/Right arrows: Navigate between strokes")
             print("  'a': Show average across all strokes")
