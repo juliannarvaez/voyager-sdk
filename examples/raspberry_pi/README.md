@@ -142,16 +142,90 @@ AXELERA_CONFIGURE_BOARD=,20 python rowing_ergometer_recording.py \
 **Module Structure:**
 ```
 examples/raspberry_pi/
-├── rowing_ergometer/              # Recording module
-│   ├── __init__.py
+├── README.md                      # This file
+├── rowing_cpp.so                  # Compiled C++ module
+├── rowing_ergometer_recording.py  # Main recording script
+├── analyze_strokes.py             # Data analysis tool
+├── record_keypoints.py            # Simple keypoint recording
+├── csi_direct_pipeline.sh         # CSI camera setup script
+├── rowing_ergometer/              # Python module
+│   ├── __init__.py                # Backend selector (C++ or Python)
 │   ├── keypoint_recorder.py       # Circular buffer & event capture
 │   ├── phase_controller.py        # PM5 phase detection
-│   └── pyrow/                     # PM5 USB communication (from cameraerg)
-│       ├── pyrow.py
-│       └── csafe/                 # CSAFE protocol
-├── rowing_ergometer_recording.py  # Main recording script
-└── analyze_strokes.py             # Data analysis tool
+│   ├── pyrow.py                   # PM5 USB communication
+│   └── csafe/                     # CSAFE protocol
+└── cpp/                           # C++ source files
+    ├── README.md                  # C++ implementation details
+    ├── Makefile                   # Build system
+    ├── rebuild_rowing_module.sh   # Docker build script
+    ├── keypoint_recorder.cpp/hpp  # Kalman filter implementation
+    ├── phase_controller.cpp/hpp   # Phase detection
+    └── rowing_cpp_binding.cpp     # pybind11 Python bindings
 ```
+
+## Building C++ Components
+
+The rowing ergometer uses C++ for performance-critical Kalman filtering and keypoint processing.
+
+### Prerequisites
+
+- g++ with C++20 support
+- pybind11 (for Python bindings)
+- Inside Docker container or with matching Python environment
+
+### Quick Build (in Docker)
+
+```bash
+# Enter Docker container
+docker exec -it voyager-sdk-1.5.3 /bin/bash
+cd /voyager-sdk/examples/raspberry_pi/cpp
+source ../../../venv/bin/activate
+
+# Build the Python module
+make pybind
+
+# Copy to parent directory for import
+cp rowing_cpp.so ../
+
+# Test
+python3 -c 'import rowing_cpp; print(rowing_cpp.__doc__)'
+```
+
+### Build from Host (using rebuild script)
+
+If editing source files on the host, use the rebuild script to copy files and build in Docker:
+
+```bash
+cd ~/axeleras/voyager-sdk-1.5.3/examples/raspberry_pi/cpp
+./rebuild_rowing_module.sh
+```
+
+### Makefile Targets
+
+```bash
+make pybind   # Build Python C++ module (rowing_cpp.so) - DEFAULT
+make native   # Build standalone C++ app (requires AxInferenceNet SDK)
+make clean    # Remove all build artifacts
+make test     # Test Python module imports
+make help     # Show all targets
+```
+
+### Kalman Filter Tuning
+
+The Kalman filter in [cpp/keypoint_recorder.hpp](cpp/keypoint_recorder.hpp) has tunable parameters:
+
+```cpp
+// In KalmanFilter2D constructor:
+//   Q (process noise): higher = more responsive to movement, lower = smoother
+//   R (measurement noise): higher = smoother/more lag, lower = tracks raw data
+KalmanFilter2D(float process_noise = 0.01f, float measurement_noise = 1.0f)
+
+// Velocity smoothing alpha (0.0-1.0):
+//   higher = faster velocity response, lower = smoother velocity
+float alpha = 0.5f;
+```
+
+Current defaults provide moderate smoothing that tracks motion well without excessive lag.
 
 **Analyze Recorded Strokes:**
 ```bash

@@ -274,15 +274,12 @@ class PyErg(object):
         byte_count = results['CSAFE_PM_GET_FORCEPLOTDATA'][0]
         datapoints = byte_count // 2
         
-        # DEBUG: Log raw response to understand PM5 behavior
-        if byte_count == 0:
-            print(f"DEBUG get_forceplot: byte_count=0 (PM5 buffer empty) - stroke_state={results['CSAFE_PM_GET_STROKESTATE'][0]}")
-            print(f"DEBUG get_forceplot: Full response (first 20): {results['CSAFE_PM_GET_FORCEPLOTDATA'][:20]}")
-            print(f"DEBUG get_forceplot: Command sent: {command}")
-        else:
+        # DEBUG: Log force data collection (only when data is available)
+        if byte_count > 0:
             print(f"DEBUG get_forceplot: byte_count={byte_count}, datapoints={datapoints}, stroke_state={results['CSAFE_PM_GET_STROKESTATE'][0]}")
             print(f"DEBUG get_forceplot: Force samples: {results['CSAFE_PM_GET_FORCEPLOTDATA'][1:(datapoints+1)]}")
-        sys.stdout.flush()
+            sys.stdout.flush()
+        # Don't log empty buffer - prevents misleading garbage data in debug output
         
         forceplot['forceplot'] = results['CSAFE_PM_GET_FORCEPLOTDATA'][1:(datapoints+1)]
         forceplot['strokestate'] = results['CSAFE_PM_GET_STROKESTATE'][0]

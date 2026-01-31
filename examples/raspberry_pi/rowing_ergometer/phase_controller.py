@@ -29,6 +29,7 @@ class StrokePhase(IntEnum):
 def _poll_ergometer_loop_process(callback, cached_phase, cached_force_data, stop_event, poll_interval_idle, poll_interval_drive):
     """
     Ergometer USB polling loop - runs in separate process to avoid GIL contention.
+    Optimized for ARM Cortex-A76 with CPU affinity pinning.
     
     Args:
         callback: Ergometer phase callback function
@@ -38,7 +39,14 @@ def _poll_ergometer_loop_process(callback, cached_phase, cached_force_data, stop
         poll_interval_idle: Polling interval during idle/recovery phases
         poll_interval_drive: Polling interval during drive phase
     """
-    # Note: This runs in a separate process, so it has its own Python interpreter and no GIL contention
+    # ARM optimization: Pin USB polling to cores 0-1 (separate from main inference on 2-3)
+    try:
+        import os
+        os.sched_setaffinity(0, {0, 1})  # Use cores 0-1 for USB I/O
+    except Exception:
+        pass  # Ignore if not supported
+    
+    # Note: This runs in a separate process with its own Python interpreter (no GIL contention)
     last_phase = StrokePhase.IDLE
     
     while not stop_event.is_set():
@@ -55,12 +63,14 @@ def _poll_ergometer_loop_process(callback, cached_phase, cached_force_data, stop
                     phase = result
                     force_data = []
                 
-                # Update shared phase state (atomic write to multiprocessing.Value)
-                cached_phase.value = phase
+                # Update shared phase state (atomic write to multiprocessing.Value - lock-free)
+                with cached_phase.get_lock():
+                    cached_phase.value = phase
                 
-                # Update shared force data if available
+                # Update shared force data if available (batched update for efficiency)
                 if force_data:
-                    cached_force_data[:] = force_data  # Replace list contents atomically
+                    # Replace list contents atomically (single lock acquisition)
+                    cached_force_data[:] = force_data
                 elif phase != StrokePhase.DRIVE and last_phase == StrokePhase.DRIVE:
                     # Clear force data when exiting Drive phase
                     cached_force_data[:] = []
@@ -103,7 +113,7 @@ class PhaseController:
         self.external_phase_callback: Optional[Callable[[], int]] = None
         
         # Shared memory for phase state (accessed from main process and USB polling process)
-        self._cached_phase = multiprocessing.Value('i', StrokePhase.IDLE)  # Shared integer
+        self._cached_phase = multiprocessing.Value('i', StrokePhase.IDLE, lock=True)  # Shared integer with lock
         self._manager = multiprocessing.Manager()
         self._cached_force_data = self._manager.list()  # Shared list for force data
         self._stroke_force_data = {}  # Force data keyed by stroke timestamp (main process only)
@@ -111,8 +121,9 @@ class PhaseController:
         # USB polling process (separate process = no GIL contention)
         self._polling_process = None
         self._stop_polling = multiprocessing.Event()
-        self._poll_interval_idle = 0.3  # 300ms polling during idle/recovery
-        self._poll_interval_drive = 0.05  # 50ms polling during Drive - catch PM5 force buffer before it clears
+        # Optimized intervals: faster during Drive to catch PM5 force buffer
+        self._poll_interval_idle = 0.2  # 200ms polling during idle/recovery (reduced from 300ms)
+        self._poll_interval_drive = 0.04  # 40ms polling during Drive (reduced from 50ms for better force capture)
         self._last_phase = StrokePhase.IDLE  # Track phase transitions
         
         LOG.info("PhaseController initialized for ergometer phase detection (multiprocessing mode)")
