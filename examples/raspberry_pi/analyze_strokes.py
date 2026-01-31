@@ -89,21 +89,22 @@ def moving_average(data, window_size=3):
     return result
 
 
-def compute_velocity(positions, fps=60):
+def compute_velocity(positions, fps=60, pixels_per_meter=100.0):
     """Compute velocity from position data.
     
     Args:
         positions: Array of position values (x or y coordinates)
         fps: Frames per second (default 60, will be overridden by detected FPS)
+        pixels_per_meter: Calibration factor (default 100 px/m = 1m per 100 pixels)
     
     Returns:
-        Array of velocities in pixels/second
+        Array of velocities in meters/second
     """
     if len(positions) < 2:
         return np.array([])
     
-    # Compute finite differences
-    velocities = np.diff(positions) * fps
+    # Compute finite differences in pixels/second, then convert to m/s
+    velocities = np.diff(positions) * fps / pixels_per_meter
     # Pad to match original length (duplicate last value)
     velocities = np.concatenate([velocities, [velocities[-1] if len(velocities) > 0 else 0]])
     return velocities
@@ -126,8 +127,17 @@ def visualize_keypoints(filepath: str, frame_indices: List[int] = None):
         return None
     
     data = load_stroke_file(filepath)
-    keypoints_list = data.get('keypoints', [])
-    phases = data.get('phases', [])
+    
+    # Handle both old Python format and new C++ format
+    frames_array = data.get('frames', [])
+    if frames_array:
+        # New C++ format
+        keypoints_list = [f.get('keypoints', []) for f in frames_array]
+        phases = [f.get('phase', 0) for f in frames_array]
+    else:
+        # Old Python format
+        keypoints_list = data.get('keypoints', [])
+        phases = data.get('phases', [])
     
     if not keypoints_list:
         print("No keypoints found in file")
@@ -224,8 +234,20 @@ def parse_stroke_file(filepath: str):
     """Parse stroke file and extract angles and positions."""
     data = load_stroke_file(filepath)
     
+    # Handle both old Python format and new C++ format
+    frames_array = data.get('frames', [])
+    if frames_array:
+        # New C++ format: frames array with timestamp, keypoints, phase per frame
+        frame_timestamps = [f.get('timestamp', 0) for f in frames_array]
+        keypoints_list = [f.get('keypoints', []) for f in frames_array]
+        phases = [f.get('phase', 0) for f in frames_array]
+    else:
+        # Old Python format: top-level keypoints, phases, frame_timestamps arrays
+        frame_timestamps = data.get('frame_timestamps', [])
+        keypoints_list = data.get('keypoints', [])
+        phases = data.get('phases', [])
+    
     # Detect actual FPS from timestamps
-    frame_timestamps = data.get('frame_timestamps', [])
     detected_fps = 60.0  # Default fallback
     if len(frame_timestamps) >= 10:
         intervals = [frame_timestamps[i+1] - frame_timestamps[i] for i in range(min(100, len(frame_timestamps)-1))]
@@ -233,9 +255,6 @@ def parse_stroke_file(filepath: str):
         if valid_intervals:
             avg_interval = sum(valid_intervals) / len(valid_intervals)
             detected_fps = 1.0 / avg_interval if avg_interval > 0 else 60.0
-    
-    keypoints_list = data.get('keypoints', [])
-    phases = data.get('phases', [])
     
     # Initialize data lists
     knee_angles = []
@@ -291,13 +310,13 @@ def parse_stroke_file(filepath: str):
     
     # Compute velocities using detected FPS
     shoulder_vx = compute_velocity(shoulder_x, detected_fps)
-    shoulder_vy = compute_velocity(shoulder_y, detected_fps)
+    shoulder_vy = -compute_velocity(shoulder_y, detected_fps)  # Negate y: up is positive
     hip_vx = compute_velocity(hip_x, detected_fps)
-    hip_vy = compute_velocity(hip_y, detected_fps)
+    hip_vy = -compute_velocity(hip_y, detected_fps)  # Negate y: up is positive
     knee_vx = compute_velocity(knee_x, detected_fps)
-    knee_vy = compute_velocity(knee_y, detected_fps)
+    knee_vy = -compute_velocity(knee_y, detected_fps)  # Negate y: up is positive
     ankle_vx = compute_velocity(ankle_x, detected_fps)
-    ankle_vy = compute_velocity(ankle_y, detected_fps)
+    ankle_vy = -compute_velocity(ankle_y, detected_fps)  # Negate y: up is positive
     
     # Compute speed (magnitude of velocity)
     shoulder_speed = np.sqrt(shoulder_vx**2 + shoulder_vy**2)
@@ -352,7 +371,8 @@ def parse_stroke_file(filepath: str):
         'timestamps': np.array(timestamps),
         'frame_intervals': np.array(frame_intervals),
         'instantaneous_fps': np.array(instantaneous_fps),
-        'detected_fps': detected_fps
+        'detected_fps': detected_fps,
+        'force_curve': data.get('force_curve', [])
     }
 
 
@@ -423,15 +443,17 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     
     frames = np.arange(len(knee_angles))
     
-    # Create or reuse figure with 3 subplots (added frametime)
+    # Create or reuse figure with 4 subplots (angles, vx, vy, frame timing)
     if fig is None or axes is None:
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
+        fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(14, 16))
+        axes = (ax1, ax2, ax3, ax4)
     else:
-        ax1, ax2, ax3 = axes
+        ax1, ax2, ax3, ax4 = axes
         # Clear existing content
         ax1.clear()
         ax2.clear()
         ax3.clear()
+        ax4.clear()
     
     fig.suptitle(f'Stroke Analysis [{current_file_idx + 1}/{total_files}]: {os.path.basename(filepath)}', fontsize=14)
     
@@ -445,7 +467,7 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     }
     
     # Draw phase backgrounds
-    for ax in [ax1, ax2, ax3]:
+    for ax in [ax1, ax2, ax3, ax4]:
         current_phase = None
         phase_start = 0
         for i, phase in enumerate(phases + [-1]):  # Add sentinel
@@ -464,66 +486,58 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
     
-    # Plot 2: Speed (magnitude)
-    ax2.plot(frames, shoulder_speed_smooth, 'purple', label='Shoulder', linewidth=2)
-    ax2.plot(frames, hip_speed_smooth, 'blue', label='Hip', linewidth=2)
-    ax2.plot(frames, knee_speed_smooth, 'green', label='Knee', linewidth=2)
-    ax2.plot(frames, ankle_speed_smooth, 'orange', label='Ankle', linewidth=2)
-    ax2.set_xlabel('Frame', fontsize=12)
-    ax2.set_ylabel('Speed (px/s)', fontsize=12)
-    ax2.set_title('Joint Speeds (Magnitude)', fontsize=12)
+    # Plot 2: X-Velocity (right is positive)
+    ax2.plot(frames, shoulder_vx_smooth, 'purple', label='Shoulder', linewidth=2)
+    ax2.plot(frames, hip_vx_smooth, 'blue', label='Hip', linewidth=2)
+    ax2.plot(frames, knee_vx_smooth, 'green', label='Knee', linewidth=2)
+    ax2.plot(frames, ankle_vx_smooth, 'orange', label='Ankle', linewidth=2)
+    ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.5, alpha=0.5)
+    ax2.set_ylabel('X Velocity (m/s)', fontsize=12)
+    ax2.set_title('Horizontal Velocity (Right +) [1m = 100px]', fontsize=12)
     ax2.legend(loc='upper right')
     ax2.grid(True, alpha=0.3)
     
-    # Plot 3: Frame Timing
-    frame_intervals = data.get('frame_intervals', [])
-    instantaneous_fps = data.get('instantaneous_fps', [])
-    detected_fps = data.get('detected_fps', 60.0)
-    target_interval = 1000.0 / detected_fps
-    
-    if len(frame_intervals) > 0:
-        ax3_twin = ax3.twinx()
-        
-        # Frame intervals (ms)
-        interval_smooth = moving_average(frame_intervals, window)
-        ax3.plot(frames[:len(interval_smooth)], interval_smooth, 'b-', linewidth=1.5, label='Frame Interval (ms)', alpha=0.7)
-        ax3.axhline(y=target_interval, color='b', linestyle='--', linewidth=1, alpha=0.5, label=f'Target {target_interval:.2f}ms ({detected_fps:.0f} FPS)')
-        ax3.set_ylabel('Frame Interval (ms)', color='b')
-        ax3.tick_params(axis='y', labelcolor='b')
-        ax3.grid(True, alpha=0.3)
-        ax3.legend(loc='upper left')
-        
-        # Instantaneous FPS
-        fps_smooth = moving_average(instantaneous_fps, window)
-        ax3_twin.plot(frames[:len(fps_smooth)], fps_smooth, 'r-', linewidth=1.5, label='Instantaneous FPS', alpha=0.7)
-        ax3_twin.axhline(y=detected_fps, color='r', linestyle='--', linewidth=1, alpha=0.5, label=f'Target {detected_fps:.0f} FPS')
-        ax3_twin.set_ylabel('FPS', color='r')
-        ax3_twin.tick_params(axis='y', labelcolor='r')
-        ax3_twin.set_ylim(0, 120)
-        ax3_twin.legend(loc='upper right')
-        
-        # Calculate statistics
-        avg_interval = np.mean(frame_intervals)
-        avg_fps = np.mean(instantaneous_fps[instantaneous_fps > 0]) if len(instantaneous_fps) > 0 else 0
-        jitter = np.std(frame_intervals) if len(frame_intervals) > 0 else 0
-        
-        ax3.set_title(f'Frame Timing: Avg={avg_interval:.2f}ms ({avg_fps:.1f} FPS), Jitter={jitter:.2f}ms', fontsize=10)
-    else:
-        ax3.text(0.5, 0.5, 'No timestamp data available', ha='center', va='center', transform=ax3.transAxes)
-        ax3.set_title('Frame Timing: No Data', fontsize=10)
-    
-    ax3.set_xlabel('Frame', fontsize=12)
+    # Plot 3: Y-Velocity (up is positive)
+    ax3.plot(frames, shoulder_vy_smooth, 'purple', label='Shoulder', linewidth=2)
+    ax3.plot(frames, hip_vy_smooth, 'blue', label='Hip', linewidth=2)
+    ax3.plot(frames, knee_vy_smooth, 'green', label='Knee', linewidth=2)
+    ax3.plot(frames, ankle_vy_smooth, 'orange', label='Ankle', linewidth=2)
+    ax3.axhline(y=0, color='k', linestyle='-', linewidth=0.5, alpha=0.5)
+    ax3.set_ylabel('Y Velocity (m/s)', fontsize=12)
+    ax3.set_title('Vertical Velocity (Up +) [1m = 100px]', fontsize=12)
+    ax3.legend(loc='upper right')
     ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Force Curve
+    force_curve = data.get('force_curve', [])
+    if len(force_curve) > 0:
+        # Interpolate force curve to match frame count
+        force_samples = np.array(force_curve)
+        force_x = np.linspace(0, len(frames) - 1, len(force_samples))
+        force_smooth = moving_average(force_samples, window)
+        
+        ax4.plot(force_x, force_smooth, 'r-', linewidth=2, label='Force')
+        ax4.fill_between(force_x, 0, force_smooth, alpha=0.3, color='red')
+        ax4.set_ylabel('Force', fontsize=12)
+        ax4.set_xlabel('Frame', fontsize=12)
+        ax4.set_title(f'PM5 Force Curve ({len(force_samples)} samples)', fontsize=12)
+        ax4.legend(loc='upper right')
+        ax4.grid(True, alpha=0.3)
+        ax4.set_ylim(0, max(force_samples) * 1.1 if len(force_samples) > 0 else 150)
+    else:
+        ax4.set_xlabel('Frame', fontsize=12)
+        ax4.text(0.5, 0.5, 'No force data available', ha='center', va='center', transform=ax4.transAxes)
+        ax4.set_title('PM5 Force: No Data', fontsize=10)
     
     # Highlight buffer zones (first 30 and last 30 frames)
     buffer_size = 30
-    for ax in [ax1, ax2, ax3]:
+    for ax in [ax1, ax2, ax3, ax4]:
         if len(frames) > buffer_size:
             ax.axvspan(0, buffer_size, alpha=0.1, color='gray', linestyle='--')
             ax.axvspan(len(frames) - buffer_size, len(frames), alpha=0.1, color='gray', linestyle='--')
     
     plt.tight_layout()
-    return fig, (ax1, ax2, ax3)
+    return fig, (ax1, ax2, ax3, ax4)
 
 
 def show_averages(files: List[str]):
@@ -631,10 +645,33 @@ def print_text_summary(files: List[str], stroke_num: int = None):
         print(f"Stroke {stroke_num}: {os.path.basename(filepath)}")
         print(f"{'='*70}")
         
-        phases = data.get('phases', [])
-        keypoints = data.get('keypoints', [])
+        # Handle both old and new formats
+        frames_array = data.get('frames', [])
+        if frames_array:
+            # New C++ format
+            phases = [f.get('phase', 0) for f in frames_array]
+            timestamps = [f.get('timestamp', 0) for f in frames_array]
+            keypoints = [f.get('keypoints', []) for f in frames_array]
+        else:
+            # Old Python format
+            phases = data.get('phases', [])
+            timestamps = data.get('frame_timestamps', [])
+            keypoints = data.get('keypoints', [])
         
-        print(f"\nTotal frames: {len(phases)}")
+        frame_count = data.get('frame_count', len(phases))
+        
+        print(f"\nTotal frames: {frame_count}")
+        
+        # Force curve analysis (new feature)
+        force_curve = data.get('force_curve', [])
+        if force_curve:
+            print(f"\nForce Curve:")
+            print(f"  Samples: {len(force_curve)}")
+            print(f"  Range: {min(force_curve)} - {max(force_curve)}")
+            peak_idx = force_curve.index(max(force_curve))
+            print(f"  Peak force: {max(force_curve)} at sample {peak_idx} ({peak_idx/len(force_curve)*100:.0f}%)")
+            print(f"  First 10 samples: {force_curve[:10]}")
+            print(f"  Last 10 samples: {force_curve[-10:]}")
         
         # Phase distribution
         if phases:
@@ -657,7 +694,6 @@ def print_text_summary(files: List[str], stroke_num: int = None):
                 drive_duration = drive_end - drive_start + 1
                 
                 # Calculate FPS from timestamps if available
-                timestamps = data.get('frame_timestamps', [])
                 detected_fps = 60.0
                 if len(timestamps) >= 10:
                     intervals = [timestamps[i+1] - timestamps[i] for i in range(min(100, len(timestamps)-1))]
@@ -671,14 +707,6 @@ def print_text_summary(files: List[str], stroke_num: int = None):
                 print(f"  Duration: {drive_duration} frames (~{drive_duration * 1000 / detected_fps:.0f}ms @ {detected_fps:.1f} FPS)")
         
         # Timestamp analysis
-        # Try to get timestamps from frame_timestamps field first (new format)
-        timestamps = data.get('frame_timestamps', [])
-        
-        # Fallback to extracting from keypoints (if timestamps embedded in keypoints)
-        if not timestamps:
-            for frame_kpts in keypoints:
-                if frame_kpts and 'timestamp' in frame_kpts[0]:
-                    timestamps.append(frame_kpts[0]['timestamp'])
         
         if len(timestamps) >= 2:
             intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
@@ -708,23 +736,46 @@ def print_text_summary(files: List[str], stroke_num: int = None):
         
         all_total_frames = []
         all_drive_durations = []
+        all_force_samples = []
+        all_peak_forces = []
         
         for filepath in files:
             data = load_stroke_file(filepath)
-            phases = data.get('phases', [])
             
-            all_total_frames.append(len(phases))
+            # Handle both old and new formats
+            frames_array = data.get('frames', [])
+            if frames_array:
+                # New C++ format
+                phases = [f.get('phase', 0) for f in frames_array]
+                frame_count = data.get('frame_count', len(phases))
+            else:
+                # Old Python format
+                phases = data.get('phases', [])
+                frame_count = len(phases)
+            
+            all_total_frames.append(frame_count)
             
             drive_frames = [i for i, p in enumerate(phases) if p == 2]
             if drive_frames:
                 drive_duration = drive_frames[-1] - drive_frames[0] + 1
                 all_drive_durations.append(drive_duration)
+            
+            # Collect force curve stats
+            force_curve = data.get('force_curve', [])
+            if force_curve:
+                all_force_samples.append(len(force_curve))
+                all_peak_forces.append(max(force_curve))
         
         if all_total_frames:
             print(f"\nTotal frames per stroke:")
             print(f"  Min: {min(all_total_frames)}")
             print(f"  Max: {max(all_total_frames)}")
             print(f"  Avg: {np.mean(all_total_frames):.1f}")
+        
+        if all_force_samples:
+            print(f"\nForce curve data ({len(all_force_samples)}/{len(files)} strokes):")
+            print(f"  Samples per stroke: {min(all_force_samples)}-{max(all_force_samples)} (avg: {np.mean(all_force_samples):.1f})")
+            print(f"  Peak forces: {min(all_peak_forces)}-{max(all_peak_forces)} (avg: {np.mean(all_peak_forces):.1f})")
         
         if all_drive_durations:
             print(f"\nDrive phase duration:")

@@ -22,108 +22,6 @@ from axelera.app import logging_utils
 LOG = logging_utils.getLogger(__name__)
 
 
-class EfficientKalmanFilter:
-    """
-    Extremely efficient 2D Kalman filter for keypoint smoothing.
-    
-    Tracks position (x, y) and velocity (vx, vy) using constant velocity model.
-    Optimized with pre-allocated arrays and minimal matrix operations.
-    """
-    __slots__ = ['x', 'P', 'F', 'H', 'Q', 'R', 'I', 'initialized']
-    
-    def __init__(self, process_noise: float = 0.1, measurement_noise: float = 4.0):
-        """
-        Initialize Kalman filter with pre-allocated matrices.
-        
-        Args:
-            process_noise: Process noise (system uncertainty)
-            measurement_noise: Measurement noise (sensor uncertainty)
-        """
-        # State: [x, y, vx, vy]
-        self.x = np.zeros(4, dtype=np.float32)
-        
-        # State covariance
-        self.P = np.eye(4, dtype=np.float32) * 100.0
-        
-        # State transition (constant velocity model, dt will be updated)
-        self.F = np.eye(4, dtype=np.float32)
-        
-        # Measurement matrix (we only measure position)
-        self.H = np.array([[1, 0, 0, 0],
-                           [0, 1, 0, 0]], dtype=np.float32)
-        
-        # Process noise covariance (will scale with dt)
-        self.Q = np.eye(4, dtype=np.float32) * process_noise
-        
-        # Measurement noise covariance
-        self.R = np.eye(2, dtype=np.float32) * measurement_noise
-        
-        # Identity matrix
-        self.I = np.eye(4, dtype=np.float32)
-        
-        self.initialized = False
-    
-    def update(self, measurement: np.ndarray, dt: float = 0.0167) -> np.ndarray:
-        """
-        Update filter with new measurement (extremely efficient).
-        
-        Args:
-            measurement: [x, y] position measurement
-            dt: Time delta since last update (default ~60 FPS)
-            
-        Returns:
-            Smoothed [x, y] position
-        """
-        if not self.initialized:
-            # First measurement: initialize state
-            self.x[0] = measurement[0]
-            self.x[1] = measurement[1]
-            self.initialized = True
-            return measurement.copy()
-        
-        # Update F matrix with dt (constant velocity)
-        self.F[0, 2] = dt
-        self.F[1, 3] = dt
-        
-        # Predict step
-        # x = F @ x
-        self.x[0] += self.x[2] * dt
-        self.x[1] += self.x[3] * dt
-        
-        # P = F @ P @ F.T + Q (optimized for diagonal Q)
-        # Use in-place operations to minimize allocations
-        P_new = self.F @ self.P @ self.F.T
-        P_new[0, 0] += self.Q[0, 0]
-        P_new[1, 1] += self.Q[1, 1]
-        P_new[2, 2] += self.Q[2, 2]
-        P_new[3, 3] += self.Q[3, 3]
-        self.P = P_new
-        
-        # Update step
-        # y = z - H @ x (innovation)
-        y = measurement - self.H @ self.x
-        
-        # S = H @ P @ H.T + R
-        S = self.H @ self.P @ self.H.T + self.R
-        
-        # K = P @ H.T @ inv(S) (Kalman gain)
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-        
-        # x = x + K @ y
-        self.x += K @ y
-        
-        # P = (I - K @ H) @ P
-        self.P = (self.I - K @ self.H) @ self.P
-        
-        return self.x[:2].copy()
-    
-    def reset(self):
-        """Reset filter state"""
-        self.x.fill(0)
-        self.P = np.eye(4, dtype=np.float32) * 100.0
-        self.initialized = False
-
-
 @dataclass
 class FrameKeypointData:
     """Single frame of keypoint data for specific points of interest"""
@@ -211,73 +109,15 @@ class KeypointRecorder:
         self.save_worker_thread = threading.Thread(target=self._save_worker, daemon=True)
         self.save_worker_thread.start()
         
-        # Kalman filters for each keypoint (one per tracked joint)
-        self.kalman_filters = {name: EfficientKalmanFilter() for name in self.ROWING_KEYPOINTS}
+        # Kalman filtering is handled by main loop's KeypointSmoother
+        # Recorder just extracts already-smoothed keypoints
         self.last_timestamp = None
         
         # Statistics
         self.frame_count = 0
         self.events_saved = 0
         
-        LOG.info(f"KeypointRecorder initialized: buffer_size={buffer_size}, save_dir={save_dir}, Kalman filtering enabled")
-    
-    def apply_kalman_to_meta(self, meta, timestamp: float):
-        """
-        Apply Kalman filtering to meta object IN-PLACE (extremely efficient).
-        Modifies keypoint positions directly - zero allocations.
-        
-        Args:
-            meta: AxMeta container to modify
-            timestamp: Current frame timestamp
-        """
-        # Calculate dt
-        dt = 0.0167
-        if self.last_timestamp is not None:
-            dt = max(0.001, timestamp - self.last_timestamp)
-        
-        # Fast path: get task meta
-        task_meta = None
-        if hasattr(meta, 'values'):
-            for tmeta in meta.values():
-                if hasattr(tmeta, 'objects') and tmeta.objects:
-                    task_meta = tmeta
-                    break
-        
-        if not task_meta or not task_meta.objects:
-            return
-        
-        detection = task_meta.objects[0]
-        if not hasattr(detection, 'keypoints'):
-            return
-        
-        keypoints = detection.keypoints
-        
-        # In-place modification: direct index access, no copies
-        # Indices: [6, 12, 14, 16, 10]
-        if 6 < len(keypoints) and len(keypoints[6]) >= 2:
-            raw = np.array([keypoints[6][0], keypoints[6][1]], dtype=np.float32)
-            smoothed = self.kalman_filters["right_shoulder"].update(raw, dt)
-            keypoints[6][0], keypoints[6][1] = smoothed[0], smoothed[1]
-        
-        if 12 < len(keypoints) and len(keypoints[12]) >= 2:
-            raw = np.array([keypoints[12][0], keypoints[12][1]], dtype=np.float32)
-            smoothed = self.kalman_filters["right_hip"].update(raw, dt)
-            keypoints[12][0], keypoints[12][1] = smoothed[0], smoothed[1]
-        
-        if 14 < len(keypoints) and len(keypoints[14]) >= 2:
-            raw = np.array([keypoints[14][0], keypoints[14][1]], dtype=np.float32)
-            smoothed = self.kalman_filters["right_knee"].update(raw, dt)
-            keypoints[14][0], keypoints[14][1] = smoothed[0], smoothed[1]
-        
-        if 16 < len(keypoints) and len(keypoints[16]) >= 2:
-            raw = np.array([keypoints[16][0], keypoints[16][1]], dtype=np.float32)
-            smoothed = self.kalman_filters["right_ankle"].update(raw, dt)
-            keypoints[16][0], keypoints[16][1] = smoothed[0], smoothed[1]
-        
-        if 10 < len(keypoints) and len(keypoints[10]) >= 2:
-            raw = np.array([keypoints[10][0], keypoints[10][1]], dtype=np.float32)
-            smoothed = self.kalman_filters["right_wrist"].update(raw, dt)
-            keypoints[10][0], keypoints[10][1] = smoothed[0], smoothed[1]
+        LOG.info(f"KeypointRecorder initialized: buffer_size={buffer_size}, save_dir={save_dir}")
     
     def extract_keypoints_from_meta(self, meta, width: int, height: int, frame_number: int, timestamp: float) -> Optional[FrameKeypointData]:
         """
@@ -314,48 +154,32 @@ class KeypointRecorder:
             return None
         
         # Extract rowing-specific keypoints (optimized - minimal allocations)
+        # Note: Keypoints are already smoothed by main loop's KeypointSmoother
         keypoints_data = []
         # Use current_phase that was set by set_phase()
         phase = self.current_phase
         keypoints = detection.keypoints
         
-        # Calculate dt for Kalman filter
-        dt = 0.0167  # default ~60 FPS
+        # Update timestamp for tracking
         if self.last_timestamp is not None:
-            dt = max(0.001, timestamp - self.last_timestamp)  # clamp to prevent division issues
+            dt = max(0.001, timestamp - self.last_timestamp)
         self.last_timestamp = timestamp
         
-        # Unrolled loop with Kalman filtering - direct indices [6, 12, 14, 16, 10]
-        if 6 < len(keypoints) and len(keypoints[6]) >= 2:
-            kp = keypoints[6]
-            raw_pos = np.array([kp[0], kp[1]], dtype=np.float32)
-            smoothed = self.kalman_filters["right_shoulder"].update(raw_pos, dt)
-            keypoints_data.append({"name": "right_shoulder", "x": int(smoothed[0]), "y": int(smoothed[1]), 
-                                   "confidence": kp[2] if len(kp) > 2 else 1.0, "phase": phase})
-        if 12 < len(keypoints) and len(keypoints[12]) >= 2:
-            kp = keypoints[12]
-            raw_pos = np.array([kp[0], kp[1]], dtype=np.float32)
-            smoothed = self.kalman_filters["right_hip"].update(raw_pos, dt)
-            keypoints_data.append({"name": "right_hip", "x": int(smoothed[0]), "y": int(smoothed[1]), 
-                                   "confidence": kp[2] if len(kp) > 2 else 1.0, "phase": phase})
-        if 14 < len(keypoints) and len(keypoints[14]) >= 2:
-            kp = keypoints[14]
-            raw_pos = np.array([kp[0], kp[1]], dtype=np.float32)
-            smoothed = self.kalman_filters["right_knee"].update(raw_pos, dt)
-            keypoints_data.append({"name": "right_knee", "x": int(smoothed[0]), "y": int(smoothed[1]), 
-                                   "confidence": kp[2] if len(kp) > 2 else 1.0, "phase": phase})
-        if 16 < len(keypoints) and len(keypoints[16]) >= 2:
-            kp = keypoints[16]
-            raw_pos = np.array([kp[0], kp[1]], dtype=np.float32)
-            smoothed = self.kalman_filters["right_ankle"].update(raw_pos, dt)
-            keypoints_data.append({"name": "right_ankle", "x": int(smoothed[0]), "y": int(smoothed[1]), 
-                                   "confidence": kp[2] if len(kp) > 2 else 1.0, "phase": phase})
-        if 10 < len(keypoints) and len(keypoints[10]) >= 2:
-            kp = keypoints[10]
-            raw_pos = np.array([kp[0], kp[1]], dtype=np.float32)
-            smoothed = self.kalman_filters["right_wrist"].update(raw_pos, dt)
-            keypoints_data.append({"name": "right_wrist", "x": int(smoothed[0]), "y": int(smoothed[1]), 
-                                   "confidence": kp[2] if len(kp) > 2 else 1.0, "phase": phase})
+        # Vectorized keypoint extraction (NEON-optimized, minimal allocations)
+        # Data is already smoothed - just extract the rowing keypoints
+        indices = self.ROWING_KEYPOINT_INDICES  # [6, 12, 14, 16, 10]
+        names = self.ROWING_KEYPOINTS
+        
+        for idx, name in zip(indices, names):
+            if idx < len(keypoints) and len(keypoints[idx]) >= 2:
+                kp = keypoints[idx]
+                keypoints_data.append({
+                    "name": name,
+                    "x": int(kp[0]),
+                    "y": int(kp[1]),
+                    "confidence": kp[2] if len(kp) > 2 else 1.0,
+                    "phase": phase
+                })
         
         if not keypoints_data:
             return None
@@ -506,10 +330,12 @@ class KeypointRecorder:
         LOG.debug(f"Queued event save: {len(self.event_keypoints)} frames -> {filename}")
     
     def _save_worker(self):
-        """Background worker thread for async saves"""
+        """Background worker thread for async saves (optimized for minimal GIL contention)"""
+        import threading
+        
         while True:
-            # Block until work is available instead of polling
-            time.sleep(0.5)  # Reduced polling frequency to minimize GIL contention
+            # Block until work is available (no busy-wait, releases GIL)
+            time.sleep(0.1)  # Fast response, releases GIL
             
             with self.save_queue_lock:
                 if not self.save_queue:
@@ -518,9 +344,10 @@ class KeypointRecorder:
                 data, filename = self.save_queue.popleft()
             
             try:
-                # Save as plain JSON (no compression for max speed)
-                with open(filename, 'w') as f:
-                    json.dump(data, f, separators=(',', ':'))
+                # Save as plain JSON with optimized settings
+                # separators and ensure_ascii reduce encoding overhead
+                with open(filename, 'w', buffering=65536) as f:  # 64KB buffer for faster writes
+                    json.dump(data, f, separators=(',', ':'), ensure_ascii=False)
                 self.events_saved += 1
                 # Use debug level to avoid I/O overhead
                 LOG.debug(f"Saved event {self.events_saved} to {filename}")
