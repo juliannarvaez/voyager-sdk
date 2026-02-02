@@ -137,20 +137,24 @@ class KeypointRecorder:
         task_meta = None
         if hasattr(meta, 'values'):
             for tmeta in meta.values():
-                if hasattr(tmeta, 'objects') and tmeta.objects:
+                # Use TaskMeta.keypoints (same array that Kalman filter smooths)
+                # NOT Detection.keypoints which may be a different array
+                if hasattr(tmeta, 'keypoints') and tmeta.keypoints is not None:
                     task_meta = tmeta
                     break
         
         if not task_meta:
             return None
         
-        # Extract keypoints from first detection (single person rowing)
-        objects = task_meta.objects
-        if not objects:
+        # Use TaskMeta.keypoints directly (already smoothed by Kalman filter)
+        # This is the same array that smoother.smooth_inplace() modifies
+        all_keypoints = task_meta.keypoints
+        if all_keypoints is None or len(all_keypoints) == 0:
             return None
         
-        detection = objects[0]
-        if not hasattr(detection, 'keypoints'):
+        # Get first person's keypoints (already smoothed)
+        keypoints = all_keypoints[0]
+        if len(keypoints) == 0:
             return None
         
         # Extract rowing-specific keypoints (optimized - minimal allocations)
@@ -158,7 +162,6 @@ class KeypointRecorder:
         keypoints_data = []
         # Use current_phase that was set by set_phase()
         phase = self.current_phase
-        keypoints = detection.keypoints
         
         # Update timestamp for tracking
         if self.last_timestamp is not None:
@@ -173,11 +176,13 @@ class KeypointRecorder:
         for idx, name in zip(indices, names):
             if idx < len(keypoints) and len(keypoints[idx]) >= 2:
                 kp = keypoints[idx]
+                # Store as FLOAT to preserve sub-pixel precision from Kalman filter
+                # Integer truncation causes ±1px jitter → ±1 m/s velocity noise at 100fps
                 keypoints_data.append({
                     "name": name,
-                    "x": int(kp[0]),
-                    "y": int(kp[1]),
-                    "confidence": kp[2] if len(kp) > 2 else 1.0,
+                    "x": round(float(kp[0]), 2),  # 2 decimal places = 0.01px precision
+                    "y": round(float(kp[1]), 2),
+                    "confidence": float(kp[2]) if len(kp) > 2 else 1.0,
                     "phase": phase
                 })
         
@@ -187,6 +192,84 @@ class KeypointRecorder:
         return FrameKeypointData(
             frame_number=frame_number,
             timestamp=timestamp,  # Real timestamp for framerate verification
+            phase=self.current_phase,
+            keypoints=keypoints_data
+        )
+    
+    def extract_keypoints_with_velocity(self, meta, width: int, height: int, 
+                                         frame_number: int, timestamp: float,
+                                         smoother) -> Optional[FrameKeypointData]:
+        """
+        Extract keypoint data including Kalman filter velocities.
+        
+        This is the preferred method - velocities from Kalman state are much 
+        more accurate than computing velocity from position differences.
+        
+        Args:
+            meta: AxMeta container with task metas
+            width: Frame width
+            height: Frame height
+            frame_number: Current frame number
+            timestamp: Frame timestamp
+            smoother: KeypointSmoother instance to get velocities from
+            
+        Returns:
+            FrameKeypointData with velocity fields, or None if no keypoints
+        """
+        # Fast path: try to get task meta directly
+        task_meta = None
+        if hasattr(meta, 'values'):
+            for tmeta in meta.values():
+                if hasattr(tmeta, 'keypoints') and tmeta.keypoints is not None:
+                    task_meta = tmeta
+                    break
+        
+        if not task_meta:
+            return None
+        
+        all_keypoints = task_meta.keypoints
+        if all_keypoints is None or len(all_keypoints) == 0:
+            return None
+        
+        keypoints = all_keypoints[0]
+        if len(keypoints) == 0:
+            return None
+        
+        # Get Kalman velocities (pixels/second)
+        vx_all, vy_all = smoother.get_velocities(len(keypoints))
+        
+        keypoints_data = []
+        phase = self.current_phase
+        self.last_timestamp = timestamp
+        
+        # Capture ALL 17 COCO keypoints, not just rowing-specific ones
+        coco_names = [
+            "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+            "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+            "left_wrist", "right_wrist", "left_hip", "right_hip",
+            "left_knee", "right_knee", "left_ankle", "right_ankle"
+        ]
+        
+        for idx, name in enumerate(coco_names):
+            if idx < len(keypoints) and len(keypoints[idx]) >= 2:
+                kp = keypoints[idx]
+                # Include Kalman velocity estimates (much smoother than differentiation)
+                keypoints_data.append({
+                    "name": name,
+                    "x": round(float(kp[0]), 2),
+                    "y": round(float(kp[1]), 2),
+                    "vx": round(float(vx_all[idx]), 2) if idx < len(vx_all) else 0.0,  # px/s
+                    "vy": round(float(vy_all[idx]), 2) if idx < len(vy_all) else 0.0,  # px/s
+                    "confidence": float(kp[2]) if len(kp) > 2 else 1.0,
+                    "phase": phase
+                })
+        
+        if not keypoints_data:
+            return None
+        
+        return FrameKeypointData(
+            frame_number=frame_number,
+            timestamp=timestamp,
             phase=self.current_phase,
             keypoints=keypoints_data
         )
@@ -315,6 +398,9 @@ class KeypointRecorder:
         if force_data:
             data['force'] = force_data
             LOG.info(f"Saving stroke with {len(force_data)} force samples")
+            # Clear force data after capturing it for this stroke
+            if self.phase_controller is not None:
+                self.phase_controller.clear_force_data()
         else:
             LOG.warning("No force data available for this stroke")
         
