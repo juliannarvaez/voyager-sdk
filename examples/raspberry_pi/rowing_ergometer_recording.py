@@ -45,7 +45,8 @@ from axelera.app import (
 
 # Import Python modules (no C++ dependency)
 from rowing_ergometer import KeypointRecorder, PhaseController, pyrow
-from kalman_filter import KeypointSmoother  # Use original NumPy version
+from kalman_filter import KeypointSmoother  # Kalman filter smoother
+from one_euro_filter import OneEuroSmoother  # One Euro filter smoother (adaptive)
 
 LOG = logging_utils.getLogger(__name__)
 
@@ -301,7 +302,7 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
     width, height = 0, 0
     frame_data = None
     
-    phase_update_frames = 15
+    phase_update_frames = 3  # Poll every 3 frames (~50ms @ 60fps) for accurate phase detection
     stats_interval_frames = args.stats_interval
     
     LOG.info("Starting inference loop with keypoint recording...")
@@ -315,16 +316,22 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
         LOG.info(f"Stats logging every {stats_interval_frames} frames")
     
     # Pure Python Kalman smoother (no C++ needed)
-    # Parameters tuned for FAST RESPONSE while removing YOLO jitter:
-    #   process_noise (Q=0.01): Allow model to predict motion changes quickly
-    #   measurement_noise (R=0.5): Trust measurements more = faster tracking, still filters jitter
-    #   velocity_alpha (α=0.7): Fast velocity adaptation for quick direction changes
-    smoother = KeypointSmoother(
-        process_noise=0.01,      # Allow model to predict motion changes (increased from 0.003)
-        measurement_noise=0.5,   # Trust measurements more for quick tracking (reduced from 1.0)
-        velocity_alpha=0.7       # Fast velocity adaptation for quick response (increased from 0.3)
-    )
-    LOG.info("Using pure Python Kalman filter for keypoint smoothing")
+    # Kalman filter parameters (smoother):
+    if args.filter == 'kalman':
+        smoother = KeypointSmoother(
+            process_noise=0.005,     # Lower: trust filter state more
+            measurement_noise=1.2,   # Higher: more skeptical of noisy detections
+            velocity_alpha=0.4       # Lower: smoother velocity estimation
+        )
+        LOG.info("Using Kalman filter: Q=0.005, R=1.2, alpha=0.4 (smoother)")
+    else:
+        # One Euro Filter - adaptive: smooth when still, responsive when moving
+        smoother = OneEuroSmoother(
+            min_cutoff=1.0,   # Hz - lower = smoother when stationary (try 0.5-2.0)
+            beta=0.007,       # Speed coefficient - higher = more responsive (try 0.001-0.1)
+            d_cutoff=1.0      # Derivative cutoff
+        )
+        LOG.info("Using One Euro filter: min_cutoff=1.0Hz, beta=0.007 (adaptive)")
     
     for event in tqdm(
         stream.with_events(),
@@ -376,6 +383,12 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
                         # Smooth first person's keypoints IN-PLACE
                         smoother.smooth_inplace(kpts[0], frame_timestamp)
                         
+                        # DEBUG: Print every 30 frames to verify filtering
+                        if frame_number % 30 == 0:
+                            vx, vy = smoother.get_velocities(17)
+                            # Check if kpts[0] was actually modified
+                            LOG.info(f"Frame {frame_number}: kpts[0][6] after filter = ({kpts[0][6][0]:.1f}, {kpts[0][6][1]:.1f}) vx={vx[6]:.1f}")
+                        
                         # Debug: print delta to verify filtering is happening
                         if frame_number % 180 == 0 and before is not None:
                             after = kpts[0][0]
@@ -390,10 +403,15 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
         if len(kalman_times) > 180:
             kalman_times.pop(0)
         
-        # Extract keypoints AFTER smoothing
+        # Extract keypoints WITH Kalman velocities (much more accurate than differentiating positions)
         if meta and width > 0:
-            frame_data = recorder.extract_keypoints_from_meta(meta, width, height, frame_number, frame_timestamp)
-            if not frame_data and frame_number % 100 == 0:
+            frame_data = recorder.extract_keypoints_with_velocity(
+                meta, width, height, frame_number, frame_timestamp, smoother
+            )
+            if frame_data:
+                # ADD TO BUFFER - this is what triggers event-based recording!
+                recorder.add_frame(frame_data)
+            elif frame_number % 100 == 0:
                 LOG.warning(f"Frame {frame_number}: No keypoints detected in meta")
         
         # Display the smoothed frame
@@ -474,6 +492,14 @@ def main():
         '--headless',
         action='store_true',
         help="Disable display output for minimal latency (reduces jitter by ~30-50%%)",
+    )
+    parser.add_argument(
+        '--filter',
+        type=str,
+        choices=['kalman', 'oneeuro'],
+        default='oneeuro',
+        help="Smoothing filter: 'kalman' (predictive) or 'oneeuro' (adaptive, default). "
+             "One Euro is smoother when stationary, more responsive when moving.",
     )
     
     args = parser.parse_args()

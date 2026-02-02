@@ -71,9 +71,8 @@ def _poll_ergometer_loop_process(callback, cached_phase, cached_force_data, stop
                 if force_data:
                     # Replace list contents atomically (single lock acquisition)
                     cached_force_data[:] = force_data
-                elif phase != StrokePhase.DRIVE and last_phase == StrokePhase.DRIVE:
-                    # Clear force data when exiting Drive phase
-                    cached_force_data[:] = []
+                # NOTE: Don't clear force data when exiting Drive - it needs to persist
+                # until the stroke is saved (which happens during post-event collection)
                 
                 # Adaptive polling: faster during Drive phase to catch all force samples
                 poll_interval = poll_interval_drive if phase == StrokePhase.DRIVE else poll_interval_idle
@@ -121,9 +120,11 @@ class PhaseController:
         # USB polling process (separate process = no GIL contention)
         self._polling_process = None
         self._stop_polling = multiprocessing.Event()
-        # Optimized intervals: faster during Drive to catch PM5 force buffer
-        self._poll_interval_idle = 0.2  # 200ms polling during idle/recovery (reduced from 300ms)
-        self._poll_interval_drive = 0.04  # 40ms polling during Drive (reduced from 50ms for better force capture)
+        # Fast polling all the time to catch phase transitions accurately
+        # Must poll quickly during RECOVERY/IDLE to detect DRIVE start immediately
+        # Otherwise 200ms delay = 12 frames missed @ 60fps
+        self._poll_interval_idle = 0.04  # 40ms polling always (was 200ms - too slow for transitions)
+        self._poll_interval_drive = 0.04  # 40ms polling during Drive (for force capture)
         self._last_phase = StrokePhase.IDLE  # Track phase transitions
         
         LOG.info("PhaseController initialized for ergometer phase detection (multiprocessing mode)")
@@ -180,6 +181,7 @@ class PhaseController:
     def clear_force_data(self):
         """Clear cached force data after stroke has been saved"""
         self._cached_force_data[:] = []
+        LOG.debug("Force data cleared after stroke save")
     
     def stop(self):
         """Stop background USB polling process"""

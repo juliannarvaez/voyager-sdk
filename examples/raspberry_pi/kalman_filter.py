@@ -36,9 +36,9 @@ class KalmanFilterOptimized:
     )
     
     def __init__(self, 
-                 process_noise: float = 0.1,
-                 measurement_noise: float = 0.8,
-                 velocity_alpha: float = 0.9):
+                 process_noise: float = 0.01,
+                 measurement_noise: float = 0.5,
+                 velocity_alpha: float = 0.3):
         """
         Initialize with pre-allocated arrays.
         
@@ -71,7 +71,9 @@ class KalmanFilterOptimized:
         self.Px = np.full(MAX_KEYPOINTS, 100.0, dtype=np.float32)
         self.Py = np.full(MAX_KEYPOINTS, 100.0, dtype=np.float32)
         self.initialized = np.zeros(MAX_KEYPOINTS, dtype=np.bool_)
-        self.last_update_time = np.zeros(MAX_KEYPOINTS, dtype=np.float32)  # Per-keypoint
+        # MUST be float64 to handle time.time() values like 1738345678.123
+        # float32 only has ~7 significant digits, can't distinguish consecutive timestamps
+        self.last_update_time = np.zeros(MAX_KEYPOINTS, dtype=np.float64)
         
         # Parameters
         self.Q = np.float32(process_noise)
@@ -142,9 +144,12 @@ class KalmanFilterOptimized:
             dt_array[reappeared_mask] = 0.0167
         
         # === PREDICT STEP ===
-        # x_pred = x + vx * dt (per-keypoint dt)
-        self.x[:n][update_mask] += self.vx[:n][update_mask] * dt_array[update_mask]
-        self.y[:n][update_mask] += self.vy[:n][update_mask] * dt_array[update_mask]
+        # Skip velocity-based prediction - it adds jitter from noisy velocity estimates
+        # The Kalman filter still smooths positions, just without motion prediction
+        # Velocity is still tracked (for JSON output) but not used in position updates
+        # x_pred = x (no velocity prediction)
+        # self.x[:n][update_mask] += self.vx[:n][update_mask] * dt_array[update_mask]
+        # self.y[:n][update_mask] += self.vy[:n][update_mask] * dt_array[update_mask]
         
         # P_pred = P + Q
         self.Px[:n][update_mask] += self.Q
@@ -168,18 +173,19 @@ class KalmanFilterOptimized:
         self.x[:n][update_mask] += Kx * self._work_innovation_x[:n][update_mask]
         self.y[:n][update_mask] += Ky * self._work_innovation_y[:n][update_mask]
         
-        # Velocity update (exponential smoothing on innovation, per-keypoint dt)
-        valid_dt_mask = update_mask & (dt_array > 0.001)
-        if np.any(valid_dt_mask):
-            inv_dt = 1.0 / dt_array[valid_dt_mask]
-            self.vx[:n][valid_dt_mask] = (
-                (1 - self.alpha) * self.vx[:n][valid_dt_mask] + 
-                self.alpha * self._work_innovation_x[:n][valid_dt_mask] * inv_dt
-            )
-            self.vy[:n][valid_dt_mask] = (
-                (1 - self.alpha) * self.vy[:n][valid_dt_mask] + 
-                self.alpha * self._work_innovation_y[:n][valid_dt_mask] * inv_dt
-            )
+        # Velocity update: simple finite difference on smoothed positions
+        # Uses assumed constant dt (~10fps) instead of precise timestamp tracking
+        # This avoids timestamp precision issues while still providing velocity for JSON
+        assumed_dt = 0.1  # ~10fps assumed frame rate
+        
+        self.vx[:n][update_mask] = (
+            (1 - self.alpha) * self.vx[:n][update_mask] + 
+            self.alpha * self._work_innovation_x[:n][update_mask] / assumed_dt
+        )
+        self.vy[:n][update_mask] = (
+            (1 - self.alpha) * self.vy[:n][update_mask] + 
+            self.alpha * self._work_innovation_y[:n][update_mask] / assumed_dt
+        )
         
         # Update timestamps for keypoints we just processed
         self.last_update_time[:n][update_mask] = timestamp
@@ -260,6 +266,43 @@ class KeypointSmoother:
     def filter(self):
         """Access underlying filter for parameter inspection."""
         return self._filter
+    
+    def get_velocities(self, n_keypoints: int = 17) -> tuple:
+        """
+        Get current velocity estimates from Kalman filter state.
+        
+        Returns velocities in pixels/second (not m/s - caller must convert).
+        These are the optimal velocity estimates, much smoother than
+        differentiating positions because they're part of the Kalman state.
+        
+        Args:
+            n_keypoints: Number of keypoints to return velocities for
+            
+        Returns:
+            Tuple of (vx_array, vy_array) in pixels/second
+        """
+        n = min(n_keypoints, MAX_KEYPOINTS)
+        return (
+            self._filter.vx[:n].copy(),
+            self._filter.vy[:n].copy()
+        )
+    
+    def get_velocity(self, keypoint_idx: int) -> tuple:
+        """
+        Get velocity for a specific keypoint.
+        
+        Args:
+            keypoint_idx: COCO keypoint index (0-16)
+            
+        Returns:
+            Tuple of (vx, vy) in pixels/second, or (0, 0) if not initialized
+        """
+        if keypoint_idx >= MAX_KEYPOINTS or not self._filter.initialized[keypoint_idx]:
+            return (0.0, 0.0)
+        return (
+            float(self._filter.vx[keypoint_idx]),
+            float(self._filter.vy[keypoint_idx])
+        )
 
 
 # ============================================================================
