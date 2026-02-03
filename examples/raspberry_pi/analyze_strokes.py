@@ -22,6 +22,7 @@ from typing import List
 # Try to import matplotlib - if not available, run in text-only mode
 try:
     import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
@@ -444,10 +445,18 @@ def parse_stroke_file(filepath: str):
     left_wrist_y = []
     right_wrist_x = []
     right_wrist_y = []
+    left_elbow_x = []
+    left_elbow_y = []
+    right_elbow_x = []
+    right_elbow_y = []
     left_wrist_vx_kalman = []
     left_wrist_vy_kalman = []
     right_wrist_vx_kalman = []
     right_wrist_vy_kalman = []
+    left_elbow_vx_kalman = []
+    left_elbow_vy_kalman = []
+    right_elbow_vx_kalman = []
+    right_elbow_vy_kalman = []
     # Kalman filter velocities (if available in JSON)
     shoulder_vx_kalman = []
     shoulder_vy_kalman = []
@@ -460,16 +469,79 @@ def parse_stroke_file(filepath: str):
     has_kalman_velocity = False
     timestamps = []  # Real timestamps for FPS analysis
     
+    # Perspective correction parameters
+    # Camera is pointed at center of erg (hips at drive start)
+    # Need to find the camera focal point (hip position at drive start)
+    focal_point_x = None
+    
+    # First pass: find drive start to get focal point
+    for i, (frame_kpts, phase) in enumerate(zip(keypoints_list, phases)):
+        if phase == 2:  # DRIVE phase start
+            kp_dict_temp = {}
+            for kp in frame_kpts:
+                kp_dict_temp[kp['name']] = (kp['x'], kp['y'])
+            hip_coords_temp = kp_dict_temp.get('left_hip') or kp_dict_temp.get('right_hip')
+            if hip_coords_temp:
+                focal_point_x = hip_coords_temp[0]
+                break
+    
+    # Fallback to center of first frame if no drive detected
+    if focal_point_x is None and keypoints_list:
+        kp_dict_temp = {}
+        for kp in keypoints_list[0]:
+            kp_dict_temp[kp['name']] = (kp['x'], kp['y'])
+        hip_coords_temp = kp_dict_temp.get('left_hip') or kp_dict_temp.get('right_hip')
+        if hip_coords_temp:
+            focal_point_x = hip_coords_temp[0]
+        else:
+            focal_point_x = 320  # Default camera center for 640px width
+    
+    def apply_perspective_correction(x, y, focal_x, correction_strength=0.0003):
+        """
+        Apply perspective correction to account for lens focal effect.
+        Points closer to camera (lower x in rowing) appear larger.
+        Points further from camera (higher x) appear smaller.
+        Distortion increases non-linearly with distance from focal point.
+        
+        Args:
+            x, y: Keypoint coordinates
+            focal_x: X coordinate of camera focal point (hips at drive start)
+            correction_strength: Strength of perspective effect (tune based on camera)
+        
+        Returns:
+            Corrected x, y coordinates
+        """
+        # Distance from focal point
+        dx = x - focal_x
+        
+        # Non-linear perspective scale factor
+        # Distortion increases quadratically with distance
+        # This models the pinhole camera effect more accurately
+        distortion = dx * correction_strength
+        scale_factor = 1.0 + distortion + (distortion * abs(distortion) * 0.5)
+        
+        # Apply correction to horizontal displacement from focal point
+        x_corrected = focal_x + dx * scale_factor
+        
+        return x_corrected, y
+    
     # Process each frame
     for frame_kpts in keypoints_list:
         # Build keypoint dict for this frame (include velocity if present)
         kp_dict = {}
         kp_vel_dict = {}
         for kp in frame_kpts:
-            kp_dict[kp['name']] = (kp['x'], kp['y'])
+            # Apply perspective correction to keypoint positions
+            x_corrected, y_corrected = apply_perspective_correction(kp['x'], kp['y'], focal_point_x)
+            kp_dict[kp['name']] = (x_corrected, y_corrected)
             # Check for Kalman velocities (vx, vy in px/s)
+            # Velocities also need perspective correction (distortion increases with distance)
             if 'vx' in kp and 'vy' in kp:
-                kp_vel_dict[kp['name']] = (kp['vx'], kp['vy'])
+                # Velocity correction: scale velocities by same non-linear perspective factor
+                dx = kp['x'] - focal_point_x
+                distortion = dx * 0.0003
+                scale_factor = 1.0 + distortion + (distortion * abs(distortion) * 0.5)
+                kp_vel_dict[kp['name']] = (kp['vx'] * scale_factor, kp['vy'] * scale_factor)
                 has_kalman_velocity = True
         
         # Extract coordinates
@@ -478,9 +550,11 @@ def parse_stroke_file(filepath: str):
         knee_coords = kp_dict.get('left_knee') or kp_dict.get('right_knee')
         ankle_coords = kp_dict.get('left_ankle') or kp_dict.get('right_ankle')
         
-        # Extract wrist coordinates (both left and right)
+        # Extract wrist and elbow coordinates (both left and right)
         left_wrist_coords = kp_dict.get('left_wrist')
         right_wrist_coords = kp_dict.get('right_wrist')
+        left_elbow_coords = kp_dict.get('left_elbow')
+        right_elbow_coords = kp_dict.get('right_elbow')
         
         # Extract Kalman velocities if available
         shoulder_vel = kp_vel_dict.get('left_shoulder') or kp_vel_dict.get('right_shoulder')
@@ -489,6 +563,8 @@ def parse_stroke_file(filepath: str):
         ankle_vel = kp_vel_dict.get('left_ankle') or kp_vel_dict.get('right_ankle')
         left_wrist_vel = kp_vel_dict.get('left_wrist')
         right_wrist_vel = kp_vel_dict.get('right_wrist')
+        left_elbow_vel = kp_vel_dict.get('left_elbow')
+        right_elbow_vel = kp_vel_dict.get('right_elbow')
         
         # Store wrist positions
         left_wrist_x.append(left_wrist_coords[0] if left_wrist_coords else np.nan)
@@ -496,11 +572,23 @@ def parse_stroke_file(filepath: str):
         right_wrist_x.append(right_wrist_coords[0] if right_wrist_coords else np.nan)
         right_wrist_y.append(right_wrist_coords[1] if right_wrist_coords else np.nan)
         
+        # Store elbow positions
+        left_elbow_x.append(left_elbow_coords[0] if left_elbow_coords else np.nan)
+        left_elbow_y.append(left_elbow_coords[1] if left_elbow_coords else np.nan)
+        right_elbow_x.append(right_elbow_coords[0] if right_elbow_coords else np.nan)
+        right_elbow_y.append(right_elbow_coords[1] if right_elbow_coords else np.nan)
+        
         # Store wrist velocities
         left_wrist_vx_kalman.append(left_wrist_vel[0] if left_wrist_vel else np.nan)
         left_wrist_vy_kalman.append(left_wrist_vel[1] if left_wrist_vel else np.nan)
         right_wrist_vx_kalman.append(right_wrist_vel[0] if right_wrist_vel else np.nan)
         right_wrist_vy_kalman.append(right_wrist_vel[1] if right_wrist_vel else np.nan)
+        
+        # Store elbow velocities
+        left_elbow_vx_kalman.append(left_elbow_vel[0] if left_elbow_vel else np.nan)
+        left_elbow_vy_kalman.append(left_elbow_vel[1] if left_elbow_vel else np.nan)
+        right_elbow_vx_kalman.append(right_elbow_vel[0] if right_elbow_vel else np.nan)
+        right_elbow_vy_kalman.append(right_elbow_vel[1] if right_elbow_vel else np.nan)
         
         # Store Kalman velocities (px/s)
         shoulder_vx_kalman.append(shoulder_vel[0] if shoulder_vel else np.nan)
@@ -602,24 +690,24 @@ def parse_stroke_file(filepath: str):
             instantaneous_fps.insert(0, instantaneous_fps[0])
     
     return {
-        'knee_angles': np.array(knee_angles),
-        'hip_angles': np.array(hip_angles),
-        'shoulder_y': np.array(shoulder_y),
-        'hip_y': np.array(hip_y),
-        'knee_y': np.array(knee_y),
-        'ankle_y': np.array(ankle_y),
+        # Position data
         'shoulder_x': np.array(shoulder_x),
+        'shoulder_y': np.array(shoulder_y),
         'hip_x': np.array(hip_x),
+        'hip_y': np.array(hip_y),
         'knee_x': np.array(knee_x),
+        'knee_y': np.array(knee_y),
         'ankle_x': np.array(ankle_x),
+        'ankle_y': np.array(ankle_y),
         'left_wrist_x': np.array(left_wrist_x),
         'left_wrist_y': np.array(left_wrist_y),
         'right_wrist_x': np.array(right_wrist_x),
         'right_wrist_y': np.array(right_wrist_y),
-        'left_wrist_vx': np.array(left_wrist_vx_kalman),
-        'left_wrist_vy': -np.array(left_wrist_vy_kalman),
-        'right_wrist_vx': np.array(right_wrist_vx_kalman),
-        'right_wrist_vy': -np.array(right_wrist_vy_kalman),
+        'left_elbow_x': np.array(left_elbow_x),
+        'left_elbow_y': np.array(left_elbow_y),
+        'right_elbow_x': np.array(right_elbow_x),
+        'right_elbow_y': np.array(right_elbow_y),
+        # Velocity data
         'shoulder_vx': shoulder_vx,
         'shoulder_vy': shoulder_vy,
         'hip_vx': hip_vx,
@@ -628,17 +716,27 @@ def parse_stroke_file(filepath: str):
         'knee_vy': knee_vy,
         'ankle_vx': ankle_vx,
         'ankle_vy': ankle_vy,
+        'left_wrist_vx': np.array(left_wrist_vx_kalman),
+        'left_wrist_vy': -np.array(left_wrist_vy_kalman),
+        'right_wrist_vx': np.array(right_wrist_vx_kalman),
+        'right_wrist_vy': -np.array(right_wrist_vy_kalman),
+        'left_elbow_vx': np.array(left_elbow_vx_kalman),
+        'left_elbow_vy': -np.array(left_elbow_vy_kalman),
+        'right_elbow_vx': np.array(right_elbow_vx_kalman),
+        'right_elbow_vy': -np.array(right_elbow_vy_kalman),
+        # Speed data
         'shoulder_speed': shoulder_speed,
         'hip_speed': hip_speed,
         'knee_speed': knee_speed,
         'ankle_speed': ankle_speed,
         'right_wrist_speed': right_wrist_speed,
+        # Phase and timing data
         'phases': phases,
         'timestamps': np.array(timestamps),
         'frame_intervals': np.array(frame_intervals),
         'instantaneous_fps': np.array(instantaneous_fps),
         'detected_fps': detected_fps,
-        'force_curve': data.get('force', [])  # Changed from 'force_curve' to 'force'
+        'force_curve': data.get('force', [])
     }
 
 
@@ -658,85 +756,99 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     
     data = parse_stroke_file(filepath)
     
-    knee_angles = data['knee_angles']
-    hip_angles = data['hip_angles']
-    shoulder_y = data['shoulder_y']
-    hip_y = data['hip_y']
-    knee_y = data['knee_y']
-    ankle_y = data['ankle_y']
+    # Position data
     shoulder_x = data['shoulder_x']
+    shoulder_y = data['shoulder_y']
     hip_x = data['hip_x']
+    hip_y = data['hip_y']
     knee_x = data['knee_x']
+    knee_y = data['knee_y']
     ankle_x = data['ankle_x']
+    ankle_y = data['ankle_y']
     left_wrist_x = data['left_wrist_x']
     left_wrist_y = data['left_wrist_y']
     right_wrist_x = data['right_wrist_x']
     right_wrist_y = data['right_wrist_y']
+    left_elbow_x = data['left_elbow_x']
+    left_elbow_y = data['left_elbow_y']
+    right_elbow_x = data['right_elbow_x']
+    right_elbow_y = data['right_elbow_y']
+    # Velocity data
+    shoulder_vx = data['shoulder_vx']
+    shoulder_vy = data['shoulder_vy']
+    hip_vx = data['hip_vx']
+    hip_vy = data['hip_vy']
+    knee_vx = data['knee_vx']
+    knee_vy = data['knee_vy']
+    ankle_vx = data['ankle_vx']
+    ankle_vy = data['ankle_vy']
     left_wrist_vx = data['left_wrist_vx']
     left_wrist_vy = data['left_wrist_vy']
     right_wrist_vx = data['right_wrist_vx']
     right_wrist_vy = data['right_wrist_vy']
+    # Speed data
     shoulder_speed = data['shoulder_speed']
     hip_speed = data['hip_speed']
     knee_speed = data['knee_speed']
     ankle_speed = data['ankle_speed']
     right_wrist_speed = data['right_wrist_speed']
-    shoulder_vx = data['shoulder_vx']
-    hip_vx = data['hip_vx']
-    knee_vx = data['knee_vx']
-    ankle_vx = data['ankle_vx']
-    shoulder_vy = data['shoulder_vy']
-    hip_vy = data['hip_vy']
-    knee_vy = data['knee_vy']
-    ankle_vy = data['ankle_vy']
     phases = data['phases']
     
-    # Apply smoothing
-    window = 5
-    knee_smooth = moving_average(knee_angles, window)
-    hip_smooth = moving_average(hip_angles, window)
-    shoulder_y_smooth = moving_average(shoulder_y, window)
-    hip_y_smooth = moving_average(hip_y, window)
-    knee_y_smooth = moving_average(knee_y, window)
-    ankle_y_smooth = moving_average(ankle_y, window)
-    shoulder_x_smooth = moving_average(shoulder_x, window)
-    hip_x_smooth = moving_average(hip_x, window)
-    knee_x_smooth = moving_average(knee_x, window)
-    ankle_x_smooth = moving_average(ankle_x, window)
-    left_wrist_x_smooth = moving_average(left_wrist_x, window)
-    left_wrist_y_smooth = moving_average(left_wrist_y, window)
-    right_wrist_x_smooth = moving_average(right_wrist_x, window)
-    right_wrist_y_smooth = moving_average(right_wrist_y, window)
+    # No smoothing - use raw data directly
+    shoulder_y_smooth = shoulder_y
+    hip_y_smooth = hip_y
+    knee_y_smooth = knee_y
+    ankle_y_smooth = ankle_y
+    shoulder_x_smooth = shoulder_x
+    hip_x_smooth = hip_x
+    knee_x_smooth = knee_x
+    ankle_x_smooth = ankle_x
+    left_wrist_x_smooth = left_wrist_x
+    left_wrist_y_smooth = left_wrist_y
+    right_wrist_x_smooth = right_wrist_x
+    right_wrist_y_smooth = right_wrist_y
+    left_elbow_x_smooth = left_elbow_x
+    left_elbow_y_smooth = left_elbow_y
+    right_elbow_x_smooth = right_elbow_x
+    right_elbow_y_smooth = right_elbow_y
     
-    # Velocities and speeds already smoothed in parse_stroke_file, use directly
+    # Use velocities and speeds directly without additional smoothing
     shoulder_speed_smooth = shoulder_speed
     hip_speed_smooth = hip_speed
     knee_speed_smooth = knee_speed
     ankle_speed_smooth = ankle_speed
     right_wrist_speed_smooth = right_wrist_speed
-    shoulder_vx_smooth = moving_average(shoulder_vx, window)
-    hip_vx_smooth = moving_average(hip_vx, window)
-    knee_vx_smooth = moving_average(knee_vx, window)
-    ankle_vx_smooth = moving_average(ankle_vx, window)
-    shoulder_vy_smooth = moving_average(shoulder_vy, window)
-    hip_vy_smooth = moving_average(hip_vy, window)
-    knee_vy_smooth = moving_average(knee_vy, window)
-    ankle_vy_smooth = moving_average(ankle_vy, window)
+    shoulder_vx_smooth = shoulder_vx
+    hip_vx_smooth = hip_vx
+    knee_vx_smooth = knee_vx
+    ankle_vx_smooth = ankle_vx
+    shoulder_vy_smooth = shoulder_vy
+    hip_vy_smooth = hip_vy
+    knee_vy_smooth = knee_vy
+    ankle_vy_smooth = ankle_vy
     
-    frames = np.arange(len(knee_angles))
+    frames = np.arange(len(shoulder_x))
     
-    # Create or reuse figure with 3 subplots (angles, speeds, force)
+    # Create or reuse figure with 3 subplots (animated skeleton, speeds, force)
     if fig is None or axes is None:
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 12))
+        fig = plt.figure(figsize=(14, 10))
+        ax1 = fig.add_subplot(2, 2, 1)
+        ax2 = fig.add_subplot(2, 2, 2)
+        ax3 = fig.add_subplot(2, 1, 2)
         axes = (ax1, ax2, ax3)
     else:
         ax1, ax2, ax3 = axes
-        # Clear existing content including any twin axes
+        # Stop and clear any existing animations
+        if hasattr(fig, '_animations'):
+            for anim in fig._animations:
+                anim.event_source.stop()
+            fig._animations = []
+        # Clear existing content
         ax1.clear()
         ax2.clear()
         ax3.clear()
         # Clear any twin axes that may have been created
-        for ax in [ax1, ax2, ax3]:
+        for ax in [ax2, ax3]:
             if hasattr(ax, '_twinned_axes') and ax._twinned_axes:
                 for twin in ax._twinned_axes.get_siblings(ax):
                     if twin is not ax:
@@ -753,8 +865,100 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
         4: ('lightgreen', 'RECOVERY')
     }
     
-    # Draw phase backgrounds
-    for ax in [ax1, ax2, ax3]:
+    # Plot 1: Animated Skeleton
+    # Set up the skeleton plot
+    x_min = min(min(shoulder_x_smooth), min(hip_x_smooth), min(knee_x_smooth), min(ankle_x_smooth), min(right_wrist_x_smooth), min(right_elbow_x_smooth))
+    x_max = max(max(shoulder_x_smooth), max(hip_x_smooth), max(knee_x_smooth), max(ankle_x_smooth), max(right_wrist_x_smooth), max(right_elbow_x_smooth))
+    y_min = min(min(shoulder_y_smooth), min(hip_y_smooth), min(knee_y_smooth), min(ankle_y_smooth), min(right_wrist_y_smooth), min(right_elbow_y_smooth))
+    y_max = max(max(shoulder_y_smooth), max(hip_y_smooth), max(knee_y_smooth), max(ankle_y_smooth), max(right_wrist_y_smooth), max(right_elbow_y_smooth))
+    
+    ax1.set_xlim(x_min - 20, x_max + 20)
+    ax1.set_ylim(y_max + 20, y_min - 20)  # Inverted Y
+    ax1.set_xlabel('X Position (px)', fontsize=10)
+    ax1.set_ylabel('Y Position (px)', fontsize=10)
+    ax1.set_title('Skeleton Animation (Frame: 0)', fontsize=12)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_aspect('equal')
+    
+    # Draw skeleton connections (will be updated in animation)
+    skeleton_lines = []
+    # Torso: shoulder -> hip
+    line1, = ax1.plot([], [], 'b-', linewidth=3, label='Torso')
+    skeleton_lines.append(line1)
+    # Thigh: hip -> knee
+    line2, = ax1.plot([], [], 'g-', linewidth=3, label='Thigh')
+    skeleton_lines.append(line2)
+    # Shin: knee -> ankle
+    line3, = ax1.plot([], [], 'orange', linewidth=3, label='Shin')
+    skeleton_lines.append(line3)
+    # Upper arm: shoulder -> elbow
+    line4, = ax1.plot([], [], 'r-', linewidth=3, label='Upper Arm')
+    skeleton_lines.append(line4)
+    # Forearm: elbow -> wrist
+    line5, = ax1.plot([], [], 'darkred', linewidth=3, label='Forearm')
+    skeleton_lines.append(line5)
+    
+    # Draw joints as scatter points
+    joints_scatter = ax1.scatter([], [], s=100, c='red', zorder=5)
+    
+    # Trail showing recent positions
+    trail_length = 10
+    trail_lines = []
+    for _ in range(6):  # One trail per joint (shoulder, hip, knee, ankle, elbow, wrist)
+        trail, = ax1.plot([], [], 'gray', alpha=0.3, linewidth=1)
+        trail_lines.append(trail)
+    
+    ax1.legend(loc='upper left', fontsize=8)
+    
+    # Animation function
+    def update_skeleton(frame_idx):
+        if frame_idx >= len(shoulder_x_smooth):
+            frame_idx = len(shoulder_x_smooth) - 1
+        
+        # Update skeleton lines
+        skeleton_lines[0].set_data([shoulder_x_smooth[frame_idx], hip_x_smooth[frame_idx]], 
+                                   [shoulder_y_smooth[frame_idx], hip_y_smooth[frame_idx]])
+        skeleton_lines[1].set_data([hip_x_smooth[frame_idx], knee_x_smooth[frame_idx]], 
+                                   [hip_y_smooth[frame_idx], knee_y_smooth[frame_idx]])
+        skeleton_lines[2].set_data([knee_x_smooth[frame_idx], ankle_x_smooth[frame_idx]], 
+                                   [knee_y_smooth[frame_idx], ankle_y_smooth[frame_idx]])
+        skeleton_lines[3].set_data([shoulder_x_smooth[frame_idx], right_elbow_x_smooth[frame_idx]], 
+                                   [shoulder_y_smooth[frame_idx], right_elbow_y_smooth[frame_idx]])
+        skeleton_lines[4].set_data([right_elbow_x_smooth[frame_idx], right_wrist_x_smooth[frame_idx]], 
+                                   [right_elbow_y_smooth[frame_idx], right_wrist_y_smooth[frame_idx]])
+        
+        # Update joint positions
+        joint_x = [shoulder_x_smooth[frame_idx], hip_x_smooth[frame_idx], knee_x_smooth[frame_idx], 
+                   ankle_x_smooth[frame_idx], right_elbow_x_smooth[frame_idx], right_wrist_x_smooth[frame_idx]]
+        joint_y = [shoulder_y_smooth[frame_idx], hip_y_smooth[frame_idx], knee_y_smooth[frame_idx], 
+                   ankle_y_smooth[frame_idx], right_elbow_y_smooth[frame_idx], right_wrist_y_smooth[frame_idx]]
+        joints_scatter.set_offsets(np.c_[joint_x, joint_y])
+        
+        # Update trails
+        start_idx = max(0, frame_idx - trail_length)
+        trail_lines[0].set_data(shoulder_x_smooth[start_idx:frame_idx+1], shoulder_y_smooth[start_idx:frame_idx+1])
+        trail_lines[1].set_data(hip_x_smooth[start_idx:frame_idx+1], hip_y_smooth[start_idx:frame_idx+1])
+        trail_lines[2].set_data(knee_x_smooth[start_idx:frame_idx+1], knee_y_smooth[start_idx:frame_idx+1])
+        trail_lines[3].set_data(ankle_x_smooth[start_idx:frame_idx+1], ankle_y_smooth[start_idx:frame_idx+1])
+        trail_lines[4].set_data(right_elbow_x_smooth[start_idx:frame_idx+1], right_elbow_y_smooth[start_idx:frame_idx+1])
+        trail_lines[5].set_data(right_wrist_x_smooth[start_idx:frame_idx+1], right_wrist_y_smooth[start_idx:frame_idx+1])
+        
+        # Update title with current frame and phase
+        phase_name = phase_colors.get(phases[frame_idx], ('white', f'Phase{phases[frame_idx]}'))[1]
+        ax1.set_title(f'Skeleton Animation (Frame: {frame_idx}/{len(frames)-1}, Phase: {phase_name})', fontsize=12)
+        
+        return skeleton_lines + [joints_scatter] + trail_lines
+    
+    # Create animation
+    anim = FuncAnimation(fig, update_skeleton, frames=len(frames), interval=33, blit=True, repeat=True)
+    
+    # Store animation reference to prevent garbage collection
+    if not hasattr(fig, '_animations'):
+        fig._animations = []
+    fig._animations.append(anim)
+    
+    # Draw phase backgrounds for 2D plots
+    for ax in [ax2, ax3]:
         current_phase = None
         phase_start = 0
         for i, phase in enumerate(phases + [-1]):  # Add sentinel
@@ -765,35 +969,17 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
                 current_phase = phase
                 phase_start = i
     
-    # Plot 1: Joint angles
-    ax1.plot(frames, knee_smooth, 'b-', label='Knee Angle', linewidth=2)
-    ax1.plot(frames, hip_smooth, 'r-', label='Hip Angle', linewidth=2)
-    ax1.set_ylabel('Angle (degrees)', fontsize=12)
-    ax1.set_title('Joint Angles Over Time', fontsize=12)
-    ax1.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    ax1.grid(True, alpha=0.3)
-    
     # Plot 2: Joint Speeds (magnitude of velocity = sqrt(vx^2 + vy^2))
     ax2.plot(frames, shoulder_speed_smooth, 'purple', label='Shoulder', linewidth=2)
     ax2.plot(frames, hip_speed_smooth, 'blue', label='Hip', linewidth=2)
     ax2.plot(frames, knee_speed_smooth, 'green', label='Knee', linewidth=2)
     ax2.plot(frames, ankle_speed_smooth, 'orange', label='Ankle', linewidth=2)
     ax2.plot(frames, right_wrist_speed_smooth, 'red', label='Right Wrist', linewidth=2)
-    ax2.set_ylabel('Speed (px/s)', fontsize=12)
-    ax2.set_title('Joint Speed (√(vx² + vy²)) - Right +, Up +', fontsize=12)
-    ax2.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+    ax2.set_ylabel('Speed (px/s)', fontsize=10)
+    ax2.set_xlabel('Frame', fontsize=10)
+    ax2.set_title('Joint Speed (√(vx² + vy²))', fontsize=12)
+    ax2.legend(loc='best', fontsize=8)
     ax2.grid(True, alpha=0.3)
-    
-    # Plot 3: Joint Accelerations
-    ax3.plot(frames, shoulder_accel, 'purple', label='Shoulder', linewidth=2)
-    ax3.plot(frames, hip_accel, 'blue', label='Hip', linewidth=2)
-    ax3.plot(frames, knee_accel, 'green', label='Knee', linewidth=2)
-    ax3.plot(frames, ankle_accel, 'orange', label='Ankle', linewidth=2)
-    ax3.plot(frames, right_wrist_accel, 'red', label='Right Wrist', linewidth=2)
-    ax3.set_ylabel('Acceleration (px/s²)', fontsize=12)
-    ax3.set_title('Joint Acceleration (√(ax² + ay²))', fontsize=12)
-    ax3.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    ax3.grid(True, alpha=0.3)
     
     # Plot 4: Force Curve (only during drive phase)
     force_curve = data.get('force_curve', [])  # parse_stroke_file returns 'force_curve'
@@ -808,49 +994,12 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
             # Interpolate force curve to match drive frames
             force_x = np.linspace(drive_start, drive_end, len(force_curve))
             
-            ax4.plot(force_x, force_curve, 'red', label='Force Curve', linewidth=2.5)
-            ax4.fill_between(force_x, 0, force_curve, alpha=0.3, color='red')
-            
-            # Add velocity overlay for correlation analysis
-            # Only use velocities from actual drive phase frames (not interpolated)
-            drive_frames_range = range(drive_start, drive_end + 1)
-            drive_frame_indices = [i for i in drive_frames_range if i < len(hip_speed_smooth)]
-            
-            if drive_frame_indices:
-                # Plot normalized velocities on secondary y-axis for comparison
-                ax4_twin = ax4.twinx()
-                max_force = max(force_curve) if force_curve else 1
-                
-                # Extract only drive phase velocities
-                hip_drive = hip_speed_smooth[drive_frame_indices]
-                knee_drive = knee_speed_smooth[drive_frame_indices]
-                wrist_drive = right_wrist_speed_smooth[drive_frame_indices]
-                
-                # Plot each joint velocity normalized to force scale
-                if len(hip_drive) > 0 and np.max(hip_drive) > 0:
-                    normalized_hip = hip_drive / np.max(hip_drive) * max_force
-                    ax4_twin.plot(drive_frame_indices, normalized_hip, 
-                                 alpha=0.5, linestyle='--', linewidth=1.5, color='blue', label='Hip Speed (norm)')
-                
-                if len(knee_drive) > 0 and np.max(knee_drive) > 0:
-                    normalized_knee = knee_drive / np.max(knee_drive) * max_force
-                    ax4_twin.plot(drive_frame_indices, normalized_knee, 
-                                 alpha=0.5, linestyle='--', linewidth=1.5, color='green', label='Knee Speed (norm)')
-                
-                if len(wrist_drive) > 0 and np.max(wrist_drive) > 0:
-                    normalized_wrist = wrist_drive / np.max(wrist_drive) * max_force
-                    ax4_twin.plot(drive_frame_indices, normalized_wrist, 
-                                 alpha=0.5, linestyle='--', linewidth=1.5, color='purple', label='Wrist Speed (norm)')
-                
-                ax4.set_ylabel('Force (PM5 units)', fontsize=12)
-                ax4_twin.set_ylabel('Speed (normalized)', fontsize=10)
-                ax4.set_title('Force Curve vs Joint Speeds (Drive Phase)', fontsize=12)
-                ax4.legend(loc='upper left')
-                ax4_twin.legend(loc='upper right', fontsize=9)
-            else:
-                ax4.set_ylabel('Force (PM5 units)', fontsize=12)
-                ax4.set_title('Force Curve (Drive Phase Only)', fontsize=12)
-                ax4.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+            ax3.plot(force_x, force_curve, 'red', label='Force Curve', linewidth=2.5)
+            ax3.fill_between(force_x, 0, force_curve, alpha=0.3, color='red')
+            ax3.set_ylabel('Force (PM5 units)', fontsize=10)
+            ax3.set_xlabel('Frame', fontsize=10)
+            ax3.set_title('Force Curve (Drive Phase)', fontsize=12)
+            ax3.legend(loc='best', fontsize=8)
             ax3.grid(True, alpha=0.3)
         else:
             ax3.text(0.5, 0.5, 'No drive phase detected', ha='center', va='center', transform=ax3.transAxes)
@@ -859,11 +1008,9 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
         ax3.text(0.5, 0.5, 'No force data available', ha='center', va='center', transform=ax3.transAxes)
         ax3.set_title('Force Curve (No Data)', fontsize=12)
     
-    ax3.set_xlabel('Frame', fontsize=12)
-    
-    # Highlight buffer zones (first 30 and last 30 frames)
+    # Highlight buffer zones (first 30 and last 30 frames) on 2D plots
     buffer_size = 30
-    for ax in [ax1, ax2, ax3]:
+    for ax in [ax2, ax3]:
         if len(frames) > buffer_size:
             ax.axvspan(0, buffer_size, alpha=0.1, color='gray', linestyle='--')
             ax.axvspan(len(frames) - buffer_size, len(frames), alpha=0.1, color='gray', linestyle='--')
