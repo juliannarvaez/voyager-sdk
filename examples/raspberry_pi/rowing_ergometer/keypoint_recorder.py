@@ -113,6 +113,10 @@ class KeypointRecorder:
         # Recorder just extracts already-smoothed keypoints
         self.last_timestamp = None
         
+        # For raw velocity computation when no filter is used
+        self.prev_keypoints = None  # Previous frame keypoints for finite difference
+        self.prev_timestamp = None  # Previous frame timestamp
+        
         # Statistics
         self.frame_count = 0
         self.events_saved = 0
@@ -235,8 +239,38 @@ class KeypointRecorder:
         if len(keypoints) == 0:
             return None
         
-        # Get Kalman velocities (pixels/second)
-        vx_all, vy_all = smoother.get_velocities(len(keypoints))
+        # Get velocities from filter (if enabled), otherwise compute raw finite difference
+        if smoother is not None:
+            vx_all, vy_all = smoother.get_velocities(len(keypoints))
+        else:
+            # No filter - compute raw velocities using finite differences
+            vx_all = []
+            vy_all = []
+            
+            if self.prev_keypoints is not None and self.prev_timestamp is not None:
+                dt = timestamp - self.prev_timestamp
+                if dt > 0:
+                    for idx in range(len(keypoints)):
+                        if idx < len(self.prev_keypoints) and len(keypoints[idx]) >= 2 and len(self.prev_keypoints[idx]) >= 2:
+                            # Raw velocity from position difference
+                            vx = (keypoints[idx][0] - self.prev_keypoints[idx][0]) / dt
+                            vy = (keypoints[idx][1] - self.prev_keypoints[idx][1]) / dt
+                            vx_all.append(vx)
+                            vy_all.append(vy)
+                        else:
+                            vx_all.append(0.0)
+                            vy_all.append(0.0)
+                else:
+                    vx_all = [0.0] * len(keypoints)
+                    vy_all = [0.0] * len(keypoints)
+            else:
+                # First frame - no previous data
+                vx_all = [0.0] * len(keypoints)
+                vy_all = [0.0] * len(keypoints)
+            
+            # Store current keypoints for next frame
+            self.prev_keypoints = [kp.copy() if len(kp) >= 2 else kp for kp in keypoints]
+            self.prev_timestamp = timestamp
         
         keypoints_data = []
         phase = self.current_phase
