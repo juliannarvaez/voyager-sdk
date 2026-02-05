@@ -47,6 +47,7 @@ from axelera.app import (
 from rowing_ergometer import KeypointRecorder, PhaseController, pyrow
 from kalman_filter import KeypointSmoother  # Kalman filter smoother
 from one_euro_filter import OneEuroSmoother  # One Euro filter smoother (adaptive)
+from extended_kalman_filter import EKFSmoother  # Extended Kalman filter (nonlinear)
 
 LOG = logging_utils.getLogger(__name__)
 
@@ -315,23 +316,40 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
     if stats_interval_frames > 0:
         LOG.info(f"Stats logging every {stats_interval_frames} frames")
     
-    # Pure Python Kalman smoother (no C++ needed)
-    # Kalman filter parameters (smoother):
-    if args.filter == 'kalman':
+    # Smoothing filter selection
+    smoother = None
+    if args.filter == 'none':
+        LOG.info("No filtering - using raw keypoints")
+    elif args.filter == 'kalman':
         smoother = KeypointSmoother(
             process_noise=0.005,     # Lower: trust filter state more
             measurement_noise=1.2,   # Higher: more skeptical of noisy detections
             velocity_alpha=0.4       # Lower: smoother velocity estimation
         )
         LOG.info("Using Kalman filter: Q=0.005, R=1.2, alpha=0.4 (smoother)")
-    else:
-        # One Euro Filter - adaptive: smooth when still, responsive when moving
-        smoother = OneEuroSmoother(
-            min_cutoff=1.0,   # Hz - lower = smoother when stationary (try 0.5-2.0)
-            beta=0.007,       # Speed coefficient - higher = more responsive (try 0.001-0.1)
-            d_cutoff=1.0      # Derivative cutoff
+    elif args.filter == 'ekf':
+        # Extended Kalman Filter - nonlinear motion model with acceleration
+        # Tuned to reduce overshoot: trust measurements more, predict less
+        smoother = EKFSmoother(
+            process_noise_pos=0.1,    # Position process noise
+            process_noise_vel=2.0,    # Velocity process noise (↓ from 5 - less prediction momentum)
+            process_noise_acc=15.0,   # Acceleration process noise (↓ from 30 - less aggressive predictions)
+            measurement_noise=4.0,    # Measurement noise (keep high - trust measurements)
+            damping=0.4,              # Velocity damping (↑ from 0.2 - more aggressive slowdown)
+            acc_decay=1.5             # Acceleration decay (↑ from 0.8 - faster decay to prevent overshoot)
         )
-        LOG.info("Using One Euro filter: min_cutoff=1.0Hz, beta=0.007 (adaptive)")
+        LOG.info("Using Extended Kalman filter: balanced for overshoot reduction (acc=15, vel=2, damping=0.4)")
+    else:
+        # One Euro Filter - adaptive with joint-specific tuning
+        # Frequency-tuned: 0.5Hz cutoff (smoother), 0.015 beta (responsive 2-5Hz), 2.5Hz derivative
+        # Joint-specific: wrists responsive, hips/shoulders/ankles very smooth
+        smoother = OneEuroSmoother(
+            min_cutoff=0.5,   # Hz - improved noise suppression (was 0.6)
+            beta=0.015,       # Speed coefficient - tuned for 2-5Hz motion
+            d_cutoff=2.5,     # Derivative cutoff - better velocity tracking (was 2.0)
+            joint_specific=True  # Optimize per joint type (ankles smoothed to fix harmonics)
+        )
+        LOG.info("Using One Euro filter: frequency-tuned (0.5Hz/0.015/2.5Hz), joint-specific enabled")
     
     for event in tqdm(
         stream.with_events(),
@@ -380,20 +398,25 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
                         if frame_number % 180 == 0 and len(kpts[0]) > 0:
                             before = kpts[0][0].copy() if len(kpts[0][0]) >= 2 else None
                         
-                        # Smooth first person's keypoints IN-PLACE
-                        smoother.smooth_inplace(kpts[0], frame_timestamp)
+                        # Smooth first person's keypoints IN-PLACE (if filter enabled)
+                        if smoother is not None:
+                            smoother.smooth_inplace(kpts[0], frame_timestamp)
                         
                         # DEBUG: Print every 30 frames to verify filtering
                         if frame_number % 30 == 0:
-                            vx, vy = smoother.get_velocities(17)
-                            # Check if kpts[0] was actually modified
-                            LOG.info(f"Frame {frame_number}: kpts[0][6] after filter = ({kpts[0][6][0]:.1f}, {kpts[0][6][1]:.1f}) vx={vx[6]:.1f}")
+                            if smoother is not None:
+                                vx, vy = smoother.get_velocities(17)
+                                # Check if kpts[0] was actually modified
+                                LOG.info(f"Frame {frame_number}: kpts[0][6] after filter = ({kpts[0][6][0]:.1f}, {kpts[0][6][1]:.1f}) vx={vx[6]:.1f}")
+                            else:
+                                LOG.info(f"Frame {frame_number}: kpts[0][6] (raw, no filter) = ({kpts[0][6][0]:.1f}, {kpts[0][6][1]:.1f})")
                         
                         # Debug: print delta to verify filtering is happening
                         if frame_number % 180 == 0 and before is not None:
                             after = kpts[0][0]
                             delta = np.sqrt((after[0]-before[0])**2 + (after[1]-before[1])**2)
-                            LOG.info(f"Kalman: nose before=({before[0]:.1f},{before[1]:.1f}) after=({after[0]:.1f},{after[1]:.1f}) delta={delta:.2f}px")
+                            filter_status = "raw (no filter)" if smoother is None else "filtered"
+                            LOG.info(f"{filter_status}: nose before=({before[0]:.1f},{before[1]:.1f}) after=({after[0]:.1f},{after[1]:.1f}) delta={delta:.2f}px")
                     break
         kalman_time_us = (time.perf_counter() - kalman_start) * 1_000_000
         kalman_times.append(kalman_time_us)
@@ -496,10 +519,10 @@ def main():
     parser.add_argument(
         '--filter',
         type=str,
-        choices=['kalman', 'oneeuro'],
+        choices=['none', 'kalman', 'oneeuro', 'ekf'],
         default='oneeuro',
-        help="Smoothing filter: 'kalman' (predictive) or 'oneeuro' (adaptive, default). "
-             "One Euro is smoother when stationary, more responsive when moving.",
+        help="Smoothing filter: 'none' (no filtering), 'kalman' (predictive), 'oneeuro' (adaptive, default), or 'ekf' (nonlinear with acceleration). "
+             "One Euro is smoother when stationary, more responsive when moving. EKF models acceleration explicitly.",
     )
     
     args = parser.parse_args()

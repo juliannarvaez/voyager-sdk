@@ -138,6 +138,7 @@ class OneEuroFilterOptimized:
     Vectorized One Euro Filter for all 17 COCO keypoints.
     
     Optimized for real-time performance with pre-allocated arrays.
+    Supports joint-specific parameters for better rowing motion tracking.
     """
     __slots__ = (
         'min_cutoff', 'beta', 'd_cutoff',
@@ -145,26 +146,62 @@ class OneEuroFilterOptimized:
         'dx', 'dy', 'dx_prev', 'dy_prev',
         'vx', 'vy',  # Velocity estimates
         'initialized', 'last_time',
-        '_work_valid'
+        '_work_valid',
+        'joint_specific'  # Per-joint parameters
     )
     
-    def __init__(self, min_cutoff: float = 1.0, beta: float = 0.007, d_cutoff: float = 1.0):
+    def __init__(self, min_cutoff: float = 0.5, beta: float = 0.015, d_cutoff: float = 2.5, 
+                 joint_specific: bool = True):
         """
-        Initialize One Euro Filter.
+        Initialize One Euro Filter with frequency-tuned defaults.
         
         Args:
             min_cutoff: Minimum cutoff frequency (Hz). 
-                       Lower = smoother when stationary (try 0.5-2.0)
-                       Default: 1.0 Hz
+                       Lower = smoother when stationary
+                       Default: 0.5 Hz (tuned for rowing, was 0.6)
             beta: Speed coefficient. 
-                  Higher = more responsive to fast movements (try 0.001-0.1)
-                  Default: 0.007
+                  Higher = more responsive to fast movements
+                  Default: 0.015 (tuned for 2-5Hz motion)
             d_cutoff: Cutoff for derivative estimation.
-                      Default: 1.0 Hz
+                      Default: 2.5 Hz (improved velocity tracking, was 2.0)
+            joint_specific: Use joint-specific parameters for different body parts
+                           Default: True
         """
-        self.min_cutoff = np.float32(min_cutoff)
-        self.beta = np.float32(beta)
-        self.d_cutoff = np.float32(d_cutoff)
+        # Store defaults
+        self.min_cutoff = np.full(MAX_KEYPOINTS, min_cutoff, dtype=np.float32)
+        self.beta = np.full(MAX_KEYPOINTS, beta, dtype=np.float32)
+        self.d_cutoff = np.full(MAX_KEYPOINTS, d_cutoff, dtype=np.float32)
+        self.joint_specific = joint_specific
+        
+        # Apply joint-specific tuning for rowing
+        if joint_specific:
+            # COCO keypoint indices:
+            # 0: nose, 1-2: eyes, 3-4: ears, 5-6: shoulders, 7-8: elbows
+            # 9-10: wrists, 11-12: hips, 13-14: knees, 15-16: ankles
+            
+            # Wrists (9-10): Fast, erratic - need high responsiveness
+            self.min_cutoff[9:11] = 0.8    # Higher min_cutoff (less smooth at rest)
+            self.beta[9:11] = 0.025        # Higher beta (very responsive)
+            
+            # Elbows (7-8): Medium speed
+            self.min_cutoff[7:9] = 0.7
+            self.beta[7:9] = 0.018
+            
+            # Shoulders (5-6): Slower, need maximum smoothness
+            self.min_cutoff[5:7] = 0.4     # Lower min_cutoff (very smooth)
+            self.beta[5:7] = 0.012         # Moderate responsiveness
+            
+            # Hips (11-12): Slowest, most stable - maximum smoothness
+            self.min_cutoff[11:13] = 0.3   # Lowest cutoff (smoothest)
+            self.beta[11:13] = 0.010
+            
+            # Knees (13-14): Medium speed
+            self.min_cutoff[13:15] = 0.55
+            self.beta[13:15] = 0.015
+            
+            # Ankles (15-16): Need extra smoothing to suppress 2× harmonic artifact
+            self.min_cutoff[15:17] = 0.35  # Much lower (was 0.55) - suppress harmonics
+            self.beta[15:17] = 0.008       # Less responsive (was 0.013)
         
         # Position state
         self.x = np.zeros(MAX_KEYPOINTS, dtype=np.float32)
@@ -243,8 +280,8 @@ class OneEuroFilterOptimized:
             raw_dx = (mx[i] - self.x_prev[i]) / t_e
             raw_dy = (my[i] - self.y_prev[i]) / t_e
             
-            # Smooth the derivative
-            r_d = two_pi * self.d_cutoff * t_e
+            # Smooth the derivative (using joint-specific d_cutoff)
+            r_d = two_pi * self.d_cutoff[i] * t_e
             alpha_d = r_d / (r_d + 1.0)
             self.dx[i] = alpha_d * raw_dx + (1.0 - alpha_d) * self.dx_prev[i]
             self.dy[i] = alpha_d * raw_dy + (1.0 - alpha_d) * self.dy_prev[i]
@@ -253,9 +290,9 @@ class OneEuroFilterOptimized:
             self.vx[i] = self.dx[i]
             self.vy[i] = self.dy[i]
             
-            # Compute adaptive cutoff based on speed
+            # Compute adaptive cutoff based on speed (using joint-specific parameters)
             speed = np.sqrt(self.dx[i]**2 + self.dy[i]**2)
-            cutoff = self.min_cutoff + self.beta * speed
+            cutoff = self.min_cutoff[i] + self.beta[i] * speed
             
             # Compute position smoothing factor
             r = two_pi * cutoff * t_e
@@ -294,31 +331,35 @@ class OneEuroFilterOptimized:
 class OneEuroSmoother:
     """
     High-level interface for One Euro Filter smoothing.
-    Drop-in replacement for KeypointSmoother.
+    Drop-in replacement for KeypointSmoother with enhanced joint-specific tuning.
     """
     __slots__ = ('_filter', '_frame_count')
     
     def __init__(self,
-                 min_cutoff: float = 1.0,
-                 beta: float = 0.007,
-                 d_cutoff: float = 1.0):
+                 min_cutoff: float = 0.5,
+                 beta: float = 0.015,
+                 d_cutoff: float = 2.5,
+                 joint_specific: bool = True):
         """
-        Initialize One Euro Filter smoother.
+        Initialize One Euro Filter smoother with frequency-tuned defaults.
         
         Args:
             min_cutoff: Minimum cutoff frequency (Hz).
                        Lower = smoother when stationary.
-                       Recommended: 0.5-2.0, default 1.0
+                       Default: 0.5 Hz (tuned for rowing, was 0.6)
             beta: Speed coefficient.
                   Higher = more responsive to fast movements.
-                  Recommended: 0.001-0.1, default 0.007
-            d_cutoff: Derivative cutoff frequency.
-                      Default: 1.0 Hz
+                  Default: 0.015 (tuned for 2-5Hz motion)
+            d_cutoff: Derivative cutoff frequency (Hz).
+                     Default: 2.5 Hz (improved velocity tracking, was 2.0)
+            joint_specific: Use optimized parameters per joint type.
+                           Default: True (wrists more responsive, hips/ankles smoother)
         """
         self._filter = OneEuroFilterOptimized(
             min_cutoff=min_cutoff,
             beta=beta,
-            d_cutoff=d_cutoff
+            d_cutoff=d_cutoff,
+            joint_specific=joint_specific
         )
         self._frame_count = 0
     

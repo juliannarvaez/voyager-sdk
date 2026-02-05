@@ -39,6 +39,33 @@ FILE_PATTERN = "stroke_*.json"
 current_index = [0]
 
 
+def compute_frequency_response(timestamps, velocity):
+    """
+    Compute frequency response using FFT.
+    
+    Args:
+        timestamps: Array of timestamps (seconds)
+        velocity: Array of velocity values (px/s)
+        
+    Returns:
+        frequencies (Hz), power spectral density (dB)
+    """
+    # Compute sampling rate
+    dt = np.mean(np.diff(timestamps))
+    fs = 1.0 / dt  # Sampling frequency
+    
+    # Compute FFT
+    n = len(velocity)
+    fft_values = np.fft.rfft(velocity)
+    fft_freq = np.fft.rfftfreq(n, dt)
+    
+    # Power spectral density in dB
+    psd = np.abs(fft_values) ** 2
+    psd_db = 10 * np.log10(psd + 1e-12)  # Add epsilon to avoid log(0)
+    
+    return fft_freq, psd_db
+
+
 def compute_angle(a, b, c):
     """Compute angle at point b formed by a-b-c.
     
@@ -707,6 +734,9 @@ def parse_stroke_file(filepath: str):
         'left_elbow_y': np.array(left_elbow_y),
         'right_elbow_x': np.array(right_elbow_x),
         'right_elbow_y': np.array(right_elbow_y),
+        # Angle data
+        'knee_angles': np.array(knee_angles),
+        'hip_angles': np.array(hip_angles),
         # Velocity data
         'shoulder_vx': shoulder_vx,
         'shoulder_vy': shoulder_vy,
@@ -812,12 +842,18 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     right_elbow_x_smooth = right_elbow_x
     right_elbow_y_smooth = right_elbow_y
     
+    # Compute elbow speeds from velocities
+    right_elbow_vx = data['right_elbow_vx']
+    right_elbow_vy = data['right_elbow_vy']
+    right_elbow_speed = np.sqrt(right_elbow_vx**2 + right_elbow_vy**2)
+    
     # Use velocities and speeds directly without additional smoothing
     shoulder_speed_smooth = shoulder_speed
     hip_speed_smooth = hip_speed
     knee_speed_smooth = knee_speed
     ankle_speed_smooth = ankle_speed
     right_wrist_speed_smooth = right_wrist_speed
+    right_elbow_speed_smooth = right_elbow_speed
     shoulder_vx_smooth = shoulder_vx
     hip_vx_smooth = hip_vx
     knee_vx_smooth = knee_vx
@@ -829,15 +865,16 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     
     frames = np.arange(len(shoulder_x))
     
-    # Create or reuse figure with 3 subplots (animated skeleton, speeds, force)
+    # Create or reuse figure with 4 subplots (skeleton, speeds, force, frequency)
     if fig is None or axes is None:
-        fig = plt.figure(figsize=(14, 10))
-        ax1 = fig.add_subplot(2, 2, 1)
-        ax2 = fig.add_subplot(2, 2, 2)
-        ax3 = fig.add_subplot(2, 1, 2)
-        axes = (ax1, ax2, ax3)
+        fig = plt.figure(figsize=(16, 10))
+        ax1 = fig.add_subplot(2, 3, 1)  # Skeleton
+        ax2 = fig.add_subplot(2, 3, 2)  # Speeds
+        ax3 = fig.add_subplot(2, 3, 3)  # Frequency response
+        ax4 = fig.add_subplot(2, 1, 2)  # Force curve (full width bottom)
+        axes = (ax1, ax2, ax3, ax4)
     else:
-        ax1, ax2, ax3 = axes
+        ax1, ax2, ax3, ax4 = axes
         # Stop and clear any existing animations
         if hasattr(fig, '_animations'):
             for anim in fig._animations:
@@ -847,8 +884,9 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
         ax1.clear()
         ax2.clear()
         ax3.clear()
+        ax4.clear()
         # Clear any twin axes that may have been created
-        for ax in [ax2, ax3]:
+        for ax in [ax2, ax3, ax4]:
             if hasattr(ax, '_twinned_axes') and ax._twinned_axes:
                 for twin in ax._twinned_axes.get_siblings(ax):
                     if twin is not ax:
@@ -958,7 +996,7 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     fig._animations.append(anim)
     
     # Draw phase backgrounds for 2D plots
-    for ax in [ax2, ax3]:
+    for ax in [ax2, ax4]:
         current_phase = None
         phase_start = 0
         for i, phase in enumerate(phases + [-1]):  # Add sentinel
@@ -981,6 +1019,110 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     ax2.legend(loc='best', fontsize=8)
     ax2.grid(True, alpha=0.3)
     
+    # Plot 3: Frequency Response of All Right-Side Joints
+    filter_type = data.get('filter_type', 'unknown')
+    timestamps = data['timestamps']
+    
+    # Compute frequency response for all right-side joints
+    try:
+        dt = np.mean(np.diff(timestamps))
+        fs = 1.0 / dt  # Sampling frequency
+        
+        # Compute frequency response for each joint
+        freq_shoulder, psd_shoulder = compute_frequency_response(timestamps, shoulder_speed_smooth)
+        freq_hip, psd_hip = compute_frequency_response(timestamps, hip_speed_smooth)
+        freq_knee, psd_knee = compute_frequency_response(timestamps, knee_speed_smooth)
+        freq_ankle, psd_ankle = compute_frequency_response(timestamps, ankle_speed_smooth)
+        freq_wrist, psd_wrist = compute_frequency_response(timestamps, right_wrist_speed_smooth)
+        freq_elbow, psd_elbow = compute_frequency_response(timestamps, right_elbow_speed_smooth)
+        
+        # Sum all frequency responses (convert from dB back to linear, sum, then back to dB)
+        psd_linear_sum = (10**(psd_shoulder/10) + 10**(psd_hip/10) + 10**(psd_knee/10) + 
+                          10**(psd_ankle/10) + 10**(psd_wrist/10) + 10**(psd_elbow/10))
+        psd_sum = 10 * np.log10(psd_linear_sum)
+        
+        # === FREQUENCY ANALYSIS LOGGING ===
+        print(f"\n{'='*60}")
+        print(f"FREQUENCY RESPONSE ANALYSIS")
+        print(f"{'='*60}")
+        print(f"Sampling rate: {fs:.1f} Hz")
+        print(f"Filter type: {filter_type}")
+        print(f"Stroke file: {os.path.basename(filepath)}")
+        
+        # Find dominant frequency in summed response (skip DC component at index 0)
+        freq_range_mask = (freq_shoulder[1:] > 0.1) & (freq_shoulder[1:] < 2.0)  # Focus on stroke rate range
+        if np.any(freq_range_mask):
+            dominant_idx = np.argmax(psd_sum[1:][freq_range_mask])
+            dominant_freq = freq_shoulder[1:][freq_range_mask][dominant_idx]
+            dominant_power = psd_sum[1:][freq_range_mask][dominant_idx]
+            stroke_rate_spm = dominant_freq * 60  # Convert Hz to strokes per minute
+            print(f"\nDominant Frequency: {dominant_freq:.3f} Hz ({stroke_rate_spm:.1f} SPM)")
+            print(f"  Power at dominant: {dominant_power:.1f} dB")
+        
+        # Analyze power in different frequency bands
+        bands = [
+            ("Stroke Rate (0.2-1 Hz)", 0.2, 1.0),
+            ("Low Motion (1-3 Hz)", 1.0, 3.0),
+            ("Mid Motion (3-5 Hz)", 3.0, 5.0),
+            ("High Freq Noise (5-10 Hz)", 5.0, 10.0),
+            ("Very High Noise (10-20 Hz)", 10.0, 20.0)
+        ]
+        
+        print(f"\nPower Distribution by Frequency Band:")
+        for band_name, f_low, f_high in bands:
+            band_mask = (freq_shoulder[1:] >= f_low) & (freq_shoulder[1:] < f_high)
+            if np.any(band_mask):
+                avg_power = np.mean(psd_sum[1:][band_mask])
+                max_power = np.max(psd_sum[1:][band_mask])
+                print(f"  {band_name:25s}: avg={avg_power:6.1f} dB, max={max_power:6.1f} dB")
+        
+        # Per-joint dominant frequencies
+        print(f"\nPer-Joint Dominant Frequencies (0.1-2 Hz range):")
+        joint_data = [
+            ("Shoulder", psd_shoulder),
+            ("Hip", psd_hip),
+            ("Knee", psd_knee),
+            ("Ankle", psd_ankle),
+            ("Right Wrist", psd_wrist),
+            ("Right Elbow", psd_elbow)
+        ]
+        for joint_name, psd in joint_data:
+            if np.any(freq_range_mask):
+                idx = np.argmax(psd[1:][freq_range_mask])
+                freq = freq_shoulder[1:][freq_range_mask][idx]
+                power = psd[1:][freq_range_mask][idx]
+                print(f"  {joint_name:12s}: {freq:.3f} Hz ({freq*60:.1f} SPM), power={power:.1f} dB")
+        
+        print(f"{'='*60}\n")
+        
+        # Plot summed frequency response (thicker, prominent)
+        ax3.plot(freq_shoulder[1:], psd_sum[1:], 'black', linewidth=3, label='Sum (All Joints)', alpha=0.9)
+        
+        # Plot all joints overlayed (thinner, more transparent)
+        ax3.plot(freq_shoulder[1:], psd_shoulder[1:], 'purple', linewidth=1.5, label='Shoulder', alpha=0.5)
+        ax3.plot(freq_hip[1:], psd_hip[1:], 'blue', linewidth=1.5, label='Hip', alpha=0.5)
+        ax3.plot(freq_knee[1:], psd_knee[1:], 'green', linewidth=1.5, label='Knee', alpha=0.5)
+        ax3.plot(freq_ankle[1:], psd_ankle[1:], 'orange', linewidth=1.5, label='Ankle', alpha=0.5)
+        ax3.plot(freq_wrist[1:], psd_wrist[1:], 'red', linewidth=1.5, label='Right Wrist', alpha=0.5)
+        ax3.plot(freq_elbow[1:], psd_elbow[1:], 'brown', linewidth=1.5, label='Right Elbow', alpha=0.5)
+        
+        ax3.set_xlabel('Frequency (Hz)', fontsize=10)
+        ax3.set_ylabel('Power (dB)', fontsize=10)
+        ax3.set_title(f'Joint Velocity Frequency Response ({filter_type} filter)', fontsize=12)
+        ax3.set_xlim([0, min(fs/2, 30)])  # Show up to Nyquist or 30 Hz
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(loc='best', fontsize=8)
+        
+        # Add text with filter info
+        info_text = f"Fs: {fs:.1f} Hz\nFilter: {filter_type}"
+        ax3.text(0.98, 0.98, info_text, transform=ax3.transAxes,
+                fontsize=8, verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    except Exception as e:
+        ax3.text(0.5, 0.5, f'Error computing frequency response:\n{str(e)}', 
+                ha='center', va='center', transform=ax3.transAxes, fontsize=10)
+        ax3.set_title('Frequency Response (Error)', fontsize=12)
+    
     # Plot 4: Force Curve (only during drive phase)
     force_curve = data.get('force_curve', [])  # parse_stroke_file returns 'force_curve'
     if force_curve:
@@ -994,52 +1136,70 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
             # Interpolate force curve to match drive frames
             force_x = np.linspace(drive_start, drive_end, len(force_curve))
             
-            ax3.plot(force_x, force_curve, 'red', label='Force Curve', linewidth=2.5)
-            ax3.fill_between(force_x, 0, force_curve, alpha=0.3, color='red')
-            ax3.set_ylabel('Force (PM5 units)', fontsize=10)
-            ax3.set_xlabel('Frame', fontsize=10)
-            ax3.set_title('Force Curve (Drive Phase)', fontsize=12)
-            ax3.legend(loc='best', fontsize=8)
-            ax3.grid(True, alpha=0.3)
+            ax4.plot(force_x, force_curve, 'red', label='Force Curve', linewidth=2.5)
+            ax4.fill_between(force_x, 0, force_curve, alpha=0.3, color='red')
+            ax4.set_ylabel('Force (PM5 units)', fontsize=10)
+            ax4.set_xlabel('Frame', fontsize=10)
+            ax4.set_title('Force Curve (Drive Phase)', fontsize=12)
+            ax4.legend(loc='best', fontsize=8)
+            ax4.grid(True, alpha=0.3)
         else:
-            ax3.text(0.5, 0.5, 'No drive phase detected', ha='center', va='center', transform=ax3.transAxes)
-            ax3.set_title('Force Curve (No Data)', fontsize=12)
+            ax4.text(0.5, 0.5, 'No drive phase detected', ha='center', va='center', transform=ax4.transAxes)
+            ax4.set_title('Force Curve (No Data)', fontsize=12)
     else:
-        ax3.text(0.5, 0.5, 'No force data available', ha='center', va='center', transform=ax3.transAxes)
-        ax3.set_title('Force Curve (No Data)', fontsize=12)
+        ax4.text(0.5, 0.5, 'No force data available', ha='center', va='center', transform=ax4.transAxes)
+        ax4.set_title('Force Curve (No Data)', fontsize=12)
     
     # Highlight buffer zones (first 30 and last 30 frames) on 2D plots
     buffer_size = 30
-    for ax in [ax2, ax3]:
+    for ax in [ax2, ax4]:
         if len(frames) > buffer_size:
             ax.axvspan(0, buffer_size, alpha=0.1, color='gray', linestyle='--')
             ax.axvspan(len(frames) - buffer_size, len(frames), alpha=0.1, color='gray', linestyle='--')
     
     plt.tight_layout()
-    return fig, (ax1, ax2, ax3)
+    return fig, (ax1, ax2, ax3, ax4)
 
 
 def show_averages(files: List[str]):
-    """Show average stroke data across all strokes."""
+    """Show average stroke data across all strokes including joint velocities."""
     if not HAS_MATPLOTLIB:
         print("ERROR: matplotlib not available. Install with: pip3 install matplotlib")
         return None
     
     all_knee_angles = []
     all_hip_angles = []
-    """Show average stroke data across all strokes."""
-    if not HAS_MATPLOTLIB:
-        print("ERROR: matplotlib not available. Install with: pip3 install matplotlib")
-        return None
-    
-    all_knee_angles = []
-    all_hip_angles = []
+    all_shoulder_vx = []
+    all_shoulder_vy = []
+    all_hip_vx = []
+    all_hip_vy = []
+    all_knee_vx = []
+    all_knee_vy = []
+    all_ankle_vx = []
+    all_ankle_vy = []
+    all_right_wrist_vx = []
+    all_right_wrist_vy = []
+    all_right_elbow_vx = []
+    all_right_elbow_vy = []
     max_len = 0
     
     for filepath in files:
         data = parse_stroke_file(filepath)
         all_knee_angles.append(data['knee_angles'])
         all_hip_angles.append(data['hip_angles'])
+        all_shoulder_vx.append(data['shoulder_vx'])
+        all_shoulder_vy.append(data['shoulder_vy'])
+        all_hip_vx.append(data['hip_vx'])
+        all_hip_vy.append(data['hip_vy'])
+        all_knee_vx.append(data['knee_vx'])
+        all_knee_vy.append(data['knee_vy'])
+        all_ankle_vx.append(data['ankle_vx'])
+        all_ankle_vy.append(data['ankle_vy'])
+        all_right_wrist_vx.append(data['right_wrist_vx'])
+        all_right_wrist_vy.append(data['right_wrist_vy'])
+        all_right_elbow_vx.append(data['right_elbow_vx'])
+        all_right_elbow_vy.append(data['right_elbow_vy'])
+        
         max_len = max(max_len, len(data['knee_angles']))
     
     # Pad arrays to same length
@@ -1048,28 +1208,116 @@ def show_averages(files: List[str]):
             padding = np.full(max_len - len(all_knee_angles[i]), np.nan)
             all_knee_angles[i] = np.concatenate([all_knee_angles[i], padding])
             all_hip_angles[i] = np.concatenate([all_hip_angles[i], padding])
+            all_shoulder_vx[i] = np.concatenate([all_shoulder_vx[i], padding])
+            all_shoulder_vy[i] = np.concatenate([all_shoulder_vy[i], padding])
+            all_hip_vx[i] = np.concatenate([all_hip_vx[i], padding])
+            all_hip_vy[i] = np.concatenate([all_hip_vy[i], padding])
+            all_knee_vx[i] = np.concatenate([all_knee_vx[i], padding])
+            all_knee_vy[i] = np.concatenate([all_knee_vy[i], padding])
+            all_ankle_vx[i] = np.concatenate([all_ankle_vx[i], padding])
+            all_ankle_vy[i] = np.concatenate([all_ankle_vy[i], padding])
+            all_right_wrist_vx[i] = np.concatenate([all_right_wrist_vx[i], padding])
+            all_right_wrist_vy[i] = np.concatenate([all_right_wrist_vy[i], padding])
+            all_right_elbow_vx[i] = np.concatenate([all_right_elbow_vx[i], padding])
+            all_right_elbow_vy[i] = np.concatenate([all_right_elbow_vy[i], padding])
     
     # Compute averages
     avg_knee = np.nanmean(all_knee_angles, axis=0)
     avg_hip = np.nanmean(all_hip_angles, axis=0)
+    avg_shoulder_vx = np.nanmean(all_shoulder_vx, axis=0)
+    avg_shoulder_vy = np.nanmean(all_shoulder_vy, axis=0)
+    avg_hip_vx = np.nanmean(all_hip_vx, axis=0)
+    avg_hip_vy = np.nanmean(all_hip_vy, axis=0)
+    avg_knee_vx = np.nanmean(all_knee_vx, axis=0)
+    avg_knee_vy = np.nanmean(all_knee_vy, axis=0)
+    avg_ankle_vx = np.nanmean(all_ankle_vx, axis=0)
+    avg_ankle_vy = np.nanmean(all_ankle_vy, axis=0)
+    avg_right_wrist_vx = np.nanmean(all_right_wrist_vx, axis=0)
+    avg_right_wrist_vy = np.nanmean(all_right_wrist_vy, axis=0)
+    avg_right_elbow_vx = np.nanmean(all_right_elbow_vx, axis=0)
+    avg_right_elbow_vy = np.nanmean(all_right_elbow_vy, axis=0)
     
     # Apply smoothing
     avg_knee_smooth = moving_average(avg_knee, 3)
     avg_hip_smooth = moving_average(avg_hip, 3)
+    avg_shoulder_vx_smooth = moving_average(avg_shoulder_vx, 3)
+    avg_shoulder_vy_smooth = moving_average(avg_shoulder_vy, 3)
+    avg_hip_vx_smooth = moving_average(avg_hip_vx, 3)
+    avg_hip_vy_smooth = moving_average(avg_hip_vy, 3)
+    avg_knee_vx_smooth = moving_average(avg_knee_vx, 3)
+    avg_knee_vy_smooth = moving_average(avg_knee_vy, 3)
+    avg_ankle_vx_smooth = moving_average(avg_ankle_vx, 3)
+    avg_ankle_vy_smooth = moving_average(avg_ankle_vy, 3)
+    avg_right_wrist_vx_smooth = moving_average(avg_right_wrist_vx, 3)
+    avg_right_wrist_vy_smooth = moving_average(avg_right_wrist_vy, 3)
+    avg_right_elbow_vx_smooth = moving_average(avg_right_elbow_vx, 3)
+    avg_right_elbow_vy_smooth = moving_average(avg_right_elbow_vy, 3)
     
     frames = np.arange(len(avg_knee))
     
-    fig, ax = plt.subplots(figsize=(8, 6))
-    fig.suptitle(f'Average Joint Angles Across {len(files)} Strokes', fontsize=14)
+    # Create figure with 3 subplots
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12))
+    fig.suptitle(f'Average Across {len(files)} Strokes', fontsize=14)
     
-    ax.plot(frames, avg_knee_smooth, 'b-', label='Avg Knee Angle', linewidth=2)
-    ax.plot(frames, avg_hip_smooth, 'r-', label='Avg Hip Angle', linewidth=2)
-    ax.set_xlabel('Frame', fontsize=12)
-    ax.set_ylabel('Angle (degrees)', fontsize=12)
-    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    ax.grid(True, alpha=0.3)
+    # Plot 1: Joint Angles
+    ax1.plot(frames, avg_knee_smooth, 'b-', label='Avg Knee Angle', linewidth=2)
+    ax1.plot(frames, avg_hip_smooth, 'r-', label='Avg Hip Angle', linewidth=2)
+    ax1.set_xlabel('Frame', fontsize=12)
+    ax1.set_ylabel('Angle (degrees)', fontsize=12)
+    ax1.set_title('Average Joint Angles', fontsize=12)
+    ax1.legend(loc='best')
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Horizontal Velocities (Vx)
+    ax2.plot(frames, avg_shoulder_vx_smooth, 'purple', label='Shoulder', linewidth=2)
+    ax2.plot(frames, avg_hip_vx_smooth, 'blue', label='Hip', linewidth=2)
+    ax2.plot(frames, avg_knee_vx_smooth, 'green', label='Knee', linewidth=2)
+    ax2.plot(frames, avg_ankle_vx_smooth, 'orange', label='Ankle', linewidth=2)
+    ax2.plot(frames, avg_right_wrist_vx_smooth, 'red', label='Right Wrist', linewidth=2)
+    ax2.plot(frames, avg_right_elbow_vx_smooth, 'brown', label='Right Elbow', linewidth=2)
+    ax2.axhline(y=0, color='black', linestyle='--', alpha=0.3)
+    ax2.set_xlabel('Frame', fontsize=12)
+    ax2.set_ylabel('Horizontal Velocity (px/s)', fontsize=12)
+    ax2.set_title('Average Horizontal Velocities (Vx)', fontsize=12)
+    ax2.legend(loc='best')
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Vertical Velocities (Vy)
+    ax3.plot(frames, avg_shoulder_vy_smooth, 'purple', label='Shoulder', linewidth=2)
+    ax3.plot(frames, avg_hip_vy_smooth, 'blue', label='Hip', linewidth=2)
+    ax3.plot(frames, avg_knee_vy_smooth, 'green', label='Knee', linewidth=2)
+    ax3.plot(frames, avg_ankle_vy_smooth, 'orange', label='Ankle', linewidth=2)
+    ax3.plot(frames, avg_right_wrist_vy_smooth, 'red', label='Right Wrist', linewidth=2)
+    ax3.plot(frames, avg_right_elbow_vy_smooth, 'brown', label='Right Elbow', linewidth=2)
+    ax3.axhline(y=0, color='black', linestyle='--', alpha=0.3)
+    ax3.set_xlabel('Frame', fontsize=12)
+    ax3.set_ylabel('Vertical Velocity (px/s)', fontsize=12)
+    ax3.set_title('Average Vertical Velocities (Vy)', fontsize=12)
+    ax3.legend(loc='best')
+    ax3.grid(True, alpha=0.3)
     
     plt.tight_layout()
+    
+    # Print statistics to console
+    print(f"\n{'='*60}")
+    print(f"AVERAGE VELOCITY STATISTICS ({len(files)} strokes)")
+    print(f"{'='*60}")
+    print(f"\nAverage Peak Horizontal Velocities (Vx, px/s):")
+    print(f"  Shoulder    : {np.nanmax(np.abs(avg_shoulder_vx_smooth)):.1f} px/s")
+    print(f"  Hip         : {np.nanmax(np.abs(avg_hip_vx_smooth)):.1f} px/s")
+    print(f"  Knee        : {np.nanmax(np.abs(avg_knee_vx_smooth)):.1f} px/s")
+    print(f"  Ankle       : {np.nanmax(np.abs(avg_ankle_vx_smooth)):.1f} px/s")
+    print(f"  Right Wrist : {np.nanmax(np.abs(avg_right_wrist_vx_smooth)):.1f} px/s")
+    print(f"  Right Elbow : {np.nanmax(np.abs(avg_right_elbow_vx_smooth)):.1f} px/s")
+    print(f"\nAverage Peak Vertical Velocities (Vy, px/s):")
+    print(f"  Shoulder    : {np.nanmax(np.abs(avg_shoulder_vy_smooth)):.1f} px/s")
+    print(f"  Hip         : {np.nanmax(np.abs(avg_hip_vy_smooth)):.1f} px/s")
+    print(f"  Knee        : {np.nanmax(np.abs(avg_knee_vy_smooth)):.1f} px/s")
+    print(f"  Ankle       : {np.nanmax(np.abs(avg_ankle_vy_smooth)):.1f} px/s")
+    print(f"  Right Wrist : {np.nanmax(np.abs(avg_right_wrist_vy_smooth)):.1f} px/s")
+    print(f"  Right Elbow : {np.nanmax(np.abs(avg_right_elbow_vy_smooth)):.1f} px/s")
+    print(f"{'='*60}\n")
+    
     return fig
 
 
@@ -1308,7 +1556,16 @@ def main():
         print(f"\nMake sure rowing_ergometer_recording.py has been run and captured strokes.")
         return
     
-    print(f"Found {len(files)} stroke file(s) in {args.data_dir}")
+    # Exclude first and last stroke (often incomplete/warmup/cooldown)
+    if len(files) > 2:
+        files = files[1:-1]
+        print(f"Found {len(files)} stroke file(s) in {args.data_dir} (excluding first and last)")
+    else:
+        print(f"Found {len(files)} stroke file(s) in {args.data_dir} (need >2 strokes to exclude first/last)")
+    
+    if not files:
+        print("No strokes to analyze after excluding first and last")
+        return
     
     # Text-only mode
     if args.text_only or not HAS_MATPLOTLIB:
