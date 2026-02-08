@@ -150,20 +150,20 @@ class OneEuroFilterOptimized:
         'joint_specific'  # Per-joint parameters
     )
     
-    def __init__(self, min_cutoff: float = 0.5, beta: float = 0.015, d_cutoff: float = 2.5, 
+    def __init__(self, min_cutoff: float = 0.1, beta: float = 0.0, d_cutoff: float = 1.0, 
                  joint_specific: bool = True):
         """
-        Initialize One Euro Filter with frequency-tuned defaults.
+        Initialize One Euro Filter with calibrated defaults.
         
         Args:
             min_cutoff: Minimum cutoff frequency (Hz). 
                        Lower = smoother when stationary
-                       Default: 0.5 Hz (tuned for rowing, was 0.6)
+                       Default: 0.1 Hz (calibrated from stroke data)
             beta: Speed coefficient. 
                   Higher = more responsive to fast movements
-                  Default: 0.015 (tuned for 2-5Hz motion)
+                  Default: 0.0 (calibrated - maximum smoothing, no speed adaptation)
             d_cutoff: Cutoff for derivative estimation.
-                      Default: 2.5 Hz (improved velocity tracking, was 2.0)
+                      Default: 1.0 Hz (standard derivative smoothing)
             joint_specific: Use joint-specific parameters for different body parts
                            Default: True
         """
@@ -336,12 +336,12 @@ class OneEuroSmoother:
     __slots__ = ('_filter', '_frame_count')
     
     def __init__(self,
-                 min_cutoff: float = 0.5,
-                 beta: float = 0.015,
-                 d_cutoff: float = 2.5,
+                 min_cutoff: float = 0.1,
+                 beta: float = 0.0,
+                 d_cutoff: float = 1.0,
                  joint_specific: bool = True):
         """
-        Initialize One Euro Filter smoother with frequency-tuned defaults.
+        Initialize One Euro Filter smoother with calibrated defaults.
         
         Args:
             min_cutoff: Minimum cutoff frequency (Hz).
