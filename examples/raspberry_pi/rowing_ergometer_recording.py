@@ -160,93 +160,250 @@ class DisplayWorker:
 
 def create_erg_phase_callback():
     """
-    Create phase callback for Concept2 PM5 ergometer.
+    Create phase callback for Concept2 PM5 ergometer with auto-reconnect.
     
     Returns:
         Callable that returns current stroke phase (0-4)
     """
-    try:
-        # Find and connect to ergometer
-        ergs = list(pyrow.find())
-        if not ergs:
-            LOG.warning("No Concept2 ergometer found")
-            return None
-        
-        erg = pyrow.PyErg(ergs[0])
-        LOG.info(f"Connected to Concept2 ergometer: {ergs[0]}")
-        
-        # Give PM5 time to stabilize after USB connection
-        time.sleep(3.0)
-        
-        # Initialize workout - CRITICAL for force data collection!
-        # PM5 only provides force plot data during an active workout
-        try:
-            erg.set_workout(distance=2000, split=100, pace=120)
-            LOG.info("Workout initialized: 2000m, split=100m, pace=120s - force data now enabled")
-        except Exception as e:
-            LOG.warning(f"Could not set workout programmatically: {e}")
-            LOG.warning("Please start a workout manually on the PM5 for force data collection")
-        
-        last_logged_phase = [0]
-        force_collected = [False]  # Track if force was collected for this stroke
-        
-        def get_phase():
-            """Get current stroke phase and force data from PM5 (complete curve via multiple polls)"""
+    erg = [None]  # Mutable container for ergometer instance
+    last_error_log = [0.0]  # Rate-limit error logging
+    consecutive_errors = [0]  # Track error count
+    
+    def connect_ergometer():
+        """Attempt to connect/reconnect to ergometer with retry"""
+        # Clean up old connection
+        if erg[0] is not None:
             try:
-                stroke_result = erg.send(['CSAFE_PM_GET_STROKESTATE'])
-                phase = stroke_result.get('CSAFE_PM_GET_STROKESTATE', [0])[0]
+                erg[0].close()
+            except Exception:
+                pass
+            erg[0] = None
+            time.sleep(0.5)  # Give USB stack time to cleanup
+        
+        # Retry connection up to 3 times for flaky cables
+        for attempt in range(3):
+            try:
+                ergs = list(pyrow.find())
+                if not ergs:
+                    if attempt == 2:
+                        return False
+                    time.sleep(0.5)
+                    continue
                 
-                if phase != last_logged_phase[0]:
-                    phase_names = {0: 'IDLE', 1: 'PREP', 2: 'DRIVE', 3: 'DWELLING', 4: 'RECOVERY'}
-                    LOG.info(f"Ergometer phase: {last_logged_phase[0]} -> {phase} ({phase_names.get(phase, 'UNKNOWN')})")
-                    
-                    # Reset force collection flag on DRIVE start
-                    if phase == 2:
-                        force_collected[0] = False
-                    
-                    last_logged_phase[0] = phase
+                erg[0] = pyrow.PyErg(ergs[0])
+                LOG.info(f"Connected to Concept2 ergometer: {ergs[0]}")
                 
-                force_curve = []
+                # Give PM5 extra time to stabilize after USB connection
+                time.sleep(2.0)
                 
-                # Collect complete force curve at START of RECOVERY phase (per PM5 spec)
-                # PM5 accumulates force during DRIVE, available in RECOVERY
-                # Must poll IMMEDIATELY when RECOVERY starts - buffer clears quickly
-                if phase == 4 and not force_collected[0]:
-                    LOG.debug("RECOVERY phase - collecting complete force curve IMMEDIATELY...")
-                    force_collected[0] = True
-                    
-                    # Aggressive polling: drain PM5 buffer as fast as possible
-                    # PM5 buffer clearing timing is undocumented - poll continuously until empty
-                    for attempt in range(20):
-                        forceplot = erg.get_forceplot()
-                        samples = forceplot.get('forceplot', []) if forceplot else []
-                        
-                        if not samples:
-                            # Buffer empty - done collecting
-                            if attempt == 0:
-                                LOG.warning("No force data available at RECOVERY start")
-                            else:
-                                LOG.debug(f"Force buffer exhausted after {attempt} polls")
-                            break
-                        
-                        force_curve.extend(samples)
-                        LOG.debug(f"Force poll {attempt + 1}: {len(samples)} samples (total: {len(force_curve)})")
-                        
-                        # No delay - continuous polling to beat PM5's buffer clearing
-                    
-                    if force_curve:
-                        LOG.info(f"Complete force curve collected: {len(force_curve)} samples")
+                # Wake PM5 if it's in sleep mode (send commands until PM5 responds)
+                LOG.info("Waking PM5...")
+                for wake_attempt in range(5):
+                    try:
+                        erg[0].send(['CSAFE_PM_GET_STROKESTATE'])
+                        # Success - PM5 is awake and responding
+                        consecutive_errors[0] = 0
+                        LOG.info("PM5 connection verified")
+                        return True
+                    except (ConnectionError, Exception) as e:
+                        if wake_attempt < 4:
+                            time.sleep(0.3)  # Brief delay between wake attempts
+                        # Keep trying - PM5 wakes up progressively
                 
-                return {'phase': phase, 'force': force_curve}
+                # Final wake attempt
+                try:
+                    erg[0].send(['CSAFE_GETSTATUS_CMD'])
+                    consecutive_errors[0] = 0
+                    LOG.info("PM5 connection verified")
+                    return True
+                except ConnectionError:
+                    if attempt < 2:
+                        LOG.warning(f"Connection test failed, retry {attempt + 2}/3...")
+                        erg[0].close()
+                        erg[0] = None
+                        time.sleep(1.0)
+                        continue
+                    return False
             except Exception as e:
+                if attempt == 2:
+                    if time.time() - last_error_log[0] > 10.0:
+                        LOG.warning(f"Failed to connect to ergometer: {e}")
+                        last_error_log[0] = time.time()
+                    return False
+                time.sleep(0.5)
+        return False
+    
+    # Initial connection
+    if not connect_ergometer():
+        LOG.warning("No Concept2 ergometer found - will retry on poll")
+        # Continue with callback that retries
+    
+    # Set up workout for force data collection using direct CSAFE commands
+    if erg[0] is not None:
+        LOG.info("Setting up PM5 workout for force data collection...")
+        try:
+            # Reset PM5 first (clears Finished/Pause states from previous workouts)
+            # PM5 state machine requires: GOFINISHED -> GOREADY
+            LOG.info("Resetting PM5 to Ready state...")
+            try:
+                erg[0].send(['CSAFE_GOFINISHED_CMD'])
+                time.sleep(0.5)
+                erg[0].send(['CSAFE_GOREADY_CMD'])
+                time.sleep(0.5)
+                LOG.info("PM5 reset to Ready state")
+            except Exception as e:
+                LOG.warning(f"Reset failed ({e}), continuing anyway...")
+            
+            # Wait for PM5 to reach Ready state (states 1/2/3 can accept workout setup)
+            LOG.info("Waiting for PM5 Ready state...")
+            start_time = time.time()
+            pm5_ready = False
+            last_state = None
+            while time.time() - start_time < 10:  # 10 second timeout
+                try:
+                    status = erg[0].send(['CSAFE_GETSTATUS_CMD'])
+                    state_raw = status.get('CSAFE_GETSTATUS_CMD', [0])[0]
+                    state = state_raw & 0x7F  # Mask high bit (transitional flag)
+                    
+                    if state != last_state:
+                        state_names = ['Error','Ready','Idle','Have ID','N/A','In Use','Pause','Finished','Manual','Offline']
+                        state_name = state_names[state] if state < len(state_names) else f'Unknown({state})'
+                        LOG.info(f"PM5 state: {state_raw} -> {state} ({state_name})")
+                        last_state = state
+                    
+                    # States 1 (Ready), 2 (Idle), or 3 (Have ID) can accept workout setup
+                    if state in [1, 2, 3]:
+                        pm5_ready = True
+                        break
+                    
+                    time.sleep(0.3)
+                except Exception as e:
+                    if time.time() - start_time < 10:
+                        time.sleep(0.5)
+                        continue
+                    break
+            
+            if not pm5_ready:
+                raise ConnectionError("PM5 not ready - select 'New Workout' on PM5 display")
+            
+            # Send workout commands individually (PM5 firmware limitation)
+            erg[0].send(['CSAFE_SETHORIZONTAL_CMD', 2000, 36])  # 2000m distance
+            time.sleep(0.3)
+            erg[0].send(['CSAFE_PM_SET_SPLITDURATION', 128, 100])  # 100m splits
+            time.sleep(0.3)
+            powerpace = int(round(2.8 / ((120 / 500.) ** 3)))
+            erg[0].send(['CSAFE_SETPOWER_CMD', powerpace, 88])  # 120W pace
+            time.sleep(0.3)
+            erg[0].send(['CSAFE_SETPROGRAM_CMD', 0, 0])  # Program 0 enables force data
+            time.sleep(0.2)
+            erg[0].send(['CSAFE_GOINUSE_CMD'])  # Activate workout
+            LOG.info("Workout configured: 2000m, 100m splits, 120W")
+            time.sleep(0.5)
+            
+            # Verify PM5 entered "In Use" state
+            try:
+                state_r = erg[0].send(['CSAFE_GETSTATUS_CMD'])
+                pm5_state = (state_r.get('CSAFE_GETSTATUS_CMD', [0])[0] & 0x7F) if state_r.get('CSAFE_GETSTATUS_CMD') else 0
+                if pm5_state == 5:
+                    LOG.info("✓ PM5 state: InUse - force data enabled")
+                else:
+                    LOG.warning(f"PM5 state: {pm5_state} (expected 5=InUse) - select workout on display if needed")
+            except Exception as e:
+                LOG.warning(f"Could not verify PM5 state: {e}")
+        except Exception as e:
+            # Fall back to simple activation without workout parameters
+            LOG.warning(f"Full workout setup failed ({e}), trying simple activation...")
+            try:
+                # Just activate PM5 for "In Use" state to enable force data
+                erg[0].send(['CSAFE_GOINUSE_CMD'])
+                time.sleep(0.5)
+                LOG.info("✓ PM5 activated for data collection")
+                LOG.warning("="*60)
+                LOG.warning("MANUAL WORKOUT RECOMMENDED:")
+                LOG.warning("  Select 'Just Row' or set distance/time on PM5 display")
+                LOG.warning("  Force data will be collected during rowing")
+                LOG.warning("="*60)
+            except Exception as e2:
+                LOG.error(f"Could not activate PM5: {e2}")
+                LOG.warning("="*60)
+                LOG.warning("MANUAL WORKOUT REQUIRED:")
+                LOG.warning("  1. Select 'New Workout' on PM5 display")
+                LOG.warning("  2. Choose 'Just Row' or set distance/time")
+                LOG.warning("  3. Begin rowing - app will collect force data")
+                LOG.warning("="*60)
+    
+    last_logged_phase = [0]
+    force_collected = [False]  # Track if force was collected for this stroke
+    
+    def get_phase():
+        """Get current stroke phase and force data from PM5 (complete curve via multiple polls) with auto-reconnect"""
+        # Auto-reconnect if disconnected
+        if erg[0] is None:
+            if not connect_ergometer():
+                return {'phase': 0, 'force': []}  # Return idle if not connected
+        
+        try:
+            stroke_result = erg[0].send(['CSAFE_PM_GET_STROKESTATE'])
+            phase = stroke_result.get('CSAFE_PM_GET_STROKESTATE', [0])[0]
+            consecutive_errors[0] = 0  # Reset error counter on success
+            
+            if phase != last_logged_phase[0]:
+                phase_names = {0: 'IDLE', 1: 'PREP', 2: 'DRIVE', 3: 'DWELLING', 4: 'RECOVERY'}
+                LOG.info(f"Ergometer phase: {last_logged_phase[0]} -> {phase} ({phase_names.get(phase, 'UNKNOWN')})")
+                
+                # Reset force collection flag on DRIVE start
+                if phase == 2:
+                    force_collected[0] = False
+                
+                last_logged_phase[0] = phase
+            
+            force_curve = []
+            
+            # Collect force curve at DWELLING/RECOVERY phase (PM5 spec)
+            # Force data accumulated during DRIVE, available in DWELLING (3) or RECOVERY (4)
+            if phase in [3, 4] and not force_collected[0]:
+                force_collected[0] = True
+                
+                # Poll PM5 buffer until empty (max 20 attempts)
+                for attempt in range(20):
+                    try:
+                        r = erg[0].send(['CSAFE_PM_GET_FORCEPLOTDATA', 64])
+                        fp = r.get('CSAFE_PM_GET_FORCEPLOTDATA', [0])
+                        byte_count = fp[0] if len(fp) > 0 else 0
+                        datapoints = byte_count // 2
+                        samples = fp[1:(datapoints+1)] if len(fp) > datapoints else []
+                    except Exception as e:
+                        if attempt == 0:
+                            LOG.warning(f"Force data query failed: {e}")
+                        break
+                    
+                    if not samples:
+                        if attempt == 0:
+                            LOG.warning("No force data available for this stroke")
+                        break
+                    
+                    force_curve.extend(samples)
+                
+                if force_curve:
+                    LOG.info(f"Force curve collected: {len(force_curve)} samples")
+            
+            return {'phase': phase, 'force': force_curve}
+        except ConnectionError as e:
+            # Connection lost - trigger reconnect
+            consecutive_errors[0] += 1
+            if consecutive_errors[0] == 1 or (time.time() - last_error_log[0] > 30.0):  # Log first error and every 30s
+                LOG.warning(f"PM5 disconnected (will auto-reconnect): {e}")
+                last_error_log[0] = time.time()
+            erg[0] = None  # Force reconnect on next poll
+            return {'phase': 0, 'force': []}
+        except Exception as e:
+            consecutive_errors[0] += 1
+            if time.time() - last_error_log[0] > 10.0:  # Rate-limit error logging
                 LOG.error(f"Error reading ergometer phase: {e}")
-                return {'phase': 0, 'force': []}
-        
-        return get_phase
-        
-    except Exception as e:
-        LOG.error(f"Failed to connect to ergometer: {e}")
-        return None
+                last_error_log[0] = time.time()
+            return {'phase': 0, 'force': []}
+    
+    return get_phase
 
 
 def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorder, controller, tracers=None):
@@ -271,13 +428,13 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
         os.sched_setaffinity(0, {2, 3})
         LOG.info("Set CPU affinity to cores 2-3 (ARM Cortex-A76 performance cores)")
     except Exception as e:
-        LOG.debug(f"Could not set CPU affinity: {e}")
+        pass  # CPU affinity optional
     
     # ARM optimization: Ensure NumPy uses NEON (if available)
     try:
         np_config = np.__config__
         if hasattr(np_config, 'show'):
-            LOG.debug("NumPy build info: optimizations may include NEON")
+            pass  # NumPy build info available if needed
     except:
         pass
 
@@ -386,7 +543,7 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
             else:
                 width, height = image.size
         
-        # Apply Kalman filter BEFORE extraction and display (smooths skeleton for display)
+        # Apply Kalman filter BEFORE extraction and display
         kalman_start = time.perf_counter()
         if meta:
             for item in meta:
@@ -394,29 +551,25 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
                 if hasattr(value, 'keypoints') and value.keypoints is not None:
                     kpts = value.keypoints
                     if len(kpts) > 0 and len(kpts[0]) > 0:
-                        # Debug: capture before/after to verify filtering
-                        if frame_number % 180 == 0 and len(kpts[0]) > 0:
-                            before = kpts[0][0].copy() if len(kpts[0][0]) >= 2 else None
-                        
-                        # Smooth first person's keypoints IN-PLACE (if filter enabled)
+                        # Smooth first person's keypoints in-place (if filter enabled)
                         if smoother is not None:
                             smoother.smooth_inplace(kpts[0], frame_timestamp)
                         
-                        # DEBUG: Print every 30 frames to verify filtering
+                        # Log velocity every 30 frames
                         if frame_number % 30 == 0:
                             if smoother is not None:
                                 vx, vy = smoother.get_velocities(17)
-                                # Check if kpts[0] was actually modified
                                 LOG.info(f"Frame {frame_number}: kpts[0][6] after filter = ({kpts[0][6][0]:.1f}, {kpts[0][6][1]:.1f}) vx={vx[6]:.1f}")
                             else:
-                                LOG.info(f"Frame {frame_number}: kpts[0][6] (raw, no filter) = ({kpts[0][6][0]:.1f}, {kpts[0][6][1]:.1f})")
+                                LOG.info(f"Frame {frame_number}: kpts[0][6] (raw) = ({kpts[0][6][0]:.1f}, {kpts[0][6][1]:.1f})")
                         
-                        # Debug: print delta to verify filtering is happening
-                        if frame_number % 180 == 0 and before is not None:
-                            after = kpts[0][0]
-                            delta = np.sqrt((after[0]-before[0])**2 + (after[1]-before[1])**2)
-                            filter_status = "raw (no filter)" if smoother is None else "filtered"
-                            LOG.info(f"{filter_status}: nose before=({before[0]:.1f},{before[1]:.1f}) after=({after[0]:.1f},{after[1]:.1f}) delta={delta:.2f}px")
+                        # Log filter delta every 180 frames
+                        if frame_number % 180 == 0 and smoother is not None:
+                            before = kpts[0][0].copy() if len(kpts[0][0]) >= 2 else None
+                            if before is not None:
+                                after = kpts[0][0]
+                                delta = np.sqrt((after[0]-before[0])**2 + (after[1]-before[1])**2)
+                                LOG.info(f"filtered: nose before=({before[0]:.1f},{before[1]:.1f}) after=({after[0]:.1f},{after[1]:.1f}) delta={delta:.2f}px")
                     break
         kalman_time_us = (time.perf_counter() - kalman_start) * 1_000_000
         kalman_times.append(kalman_time_us)
@@ -556,15 +709,10 @@ def main():
     # Link recorder to controller for force data collection
     recorder.phase_controller = controller
     
-    # Setup ergometer integration (required)
+    # Setup ergometer integration with auto-reconnect
     erg_callback = create_erg_phase_callback()
-    if erg_callback:
-        controller.set_external_phase_callback(erg_callback)
-        LOG.info("Ergometer connected - automatic phase detection enabled")
-    else:
-        LOG.error("Concept2 PM5 ergometer required but not found")
-        LOG.error("Please connect ergometer or install pyrow: pip install pyrow")
-        sys.exit(1)
+    controller.set_external_phase_callback(erg_callback)
+    LOG.info("Ergometer phase detection enabled (will auto-connect/reconnect)")
     
     # Performance tips
     if not args.no_progress:
