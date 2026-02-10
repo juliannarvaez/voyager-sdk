@@ -1358,6 +1358,87 @@ def on_key(event, files: List[str], current_idx: list, fig_state: dict):
             plt.show()
 
 
+def analyze_frame_timing(timestamps: List[float], detected_fps: float = 60.0) -> dict:
+    """
+    Comprehensive frame timing analysis with outlier detection and diagnostics.
+    
+    Args:
+        timestamps: List of frame timestamps in seconds
+        detected_fps: Detected or assumed FPS for reference
+        
+    Returns:
+        Dictionary with timing statistics and diagnostics
+    """
+    if len(timestamps) < 2:
+        return None
+    
+    intervals = np.array([timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)])
+    
+    # Basic statistics
+    avg_interval = np.mean(intervals)
+    min_interval = np.min(intervals)
+    max_interval = np.max(intervals)
+    std_interval = np.std(intervals)
+    median_interval = np.median(intervals)
+    avg_fps = 1.0 / avg_interval if avg_interval > 0 else 0
+    
+    # Expected interval based on detected FPS
+    expected_interval = 1.0 / detected_fps if detected_fps > 0 else avg_interval
+    
+    # Outlier detection using IQR method
+    q1 = np.percentile(intervals, 25)
+    q3 = np.percentile(intervals, 75)
+    iqr = q3 - q1
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    outliers = intervals[(intervals < lower_bound) | (intervals > upper_bound)]
+    outlier_count = len(outliers)
+    outlier_pct = 100.0 * outlier_count / len(intervals)
+    
+    # Frame drops detection (intervals > 1.5x expected)
+    drop_threshold = expected_interval * 1.5
+    dropped_frames = intervals[intervals > drop_threshold]
+    drop_count = len(dropped_frames)
+    drop_pct = 100.0 * drop_count / len(intervals)
+    
+    # Estimated total dropped frames (by comparing actual vs expected frame count)
+    total_duration = timestamps[-1] - timestamps[0]
+    expected_frames = int(total_duration * detected_fps)
+    actual_frames = len(timestamps)
+    estimated_drops = max(0, expected_frames - actual_frames)
+    
+    # Jitter metrics
+    jitter_ms = std_interval * 1000.0
+    cv = std_interval / avg_interval if avg_interval > 0 else 0  # Coefficient of variation
+    
+    # Timing stability (percentage of frames within ±10% of expected interval)
+    tolerance = 0.10 * expected_interval
+    stable_frames = np.sum(np.abs(intervals - expected_interval) <= tolerance)
+    stability_pct = 100.0 * stable_frames / len(intervals)
+    
+    return {
+        'count': len(timestamps),
+        'total_duration': total_duration,
+        'avg_interval': avg_interval,
+        'min_interval': min_interval,
+        'max_interval': max_interval,
+        'std_interval': std_interval,
+        'median_interval': median_interval,
+        'avg_fps': avg_fps,
+        'detected_fps': detected_fps,
+        'expected_interval': expected_interval,
+        'jitter_ms': jitter_ms,
+        'cv': cv,
+        'outlier_count': outlier_count,
+        'outlier_pct': outlier_pct,
+        'drop_count': drop_count,
+        'drop_pct': drop_pct,
+        'estimated_drops': estimated_drops,
+        'stability_pct': stability_pct,
+        'intervals': intervals,
+    }
+
+
 def print_text_summary(files: List[str], stroke_num: int = None):
     """Print text-only summary of stroke data."""
     if stroke_num is not None:
@@ -1433,24 +1514,68 @@ def print_text_summary(files: List[str], stroke_num: int = None):
                 print(f"  End frame: {drive_end}")
                 print(f"  Duration: {drive_duration} frames (~{drive_duration * 1000 / detected_fps:.0f}ms @ {detected_fps:.1f} FPS)")
         
-        # Timestamp analysis
-        
+        # Timestamp analysis with enhanced diagnostics
         if len(timestamps) >= 2:
-            intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
-            avg_interval = sum(intervals) / len(intervals)
-            min_interval = min(intervals)
-            max_interval = max(intervals)
-            jitter = np.std(intervals)
-            avg_fps = 1.0 / avg_interval if avg_interval > 0 else 0
+            # Calculate detected FPS first
+            intervals = [timestamps[i+1] - timestamps[i] for i in range(min(100, len(timestamps)-1))]
+            valid = [x for x in intervals if x > 0]
+            detected_fps = 1.0 / (sum(valid) / len(valid)) if valid else 60.0
             
-            print(f"\nFrame Timing:")
-            print(f"  Total frames with timestamps: {len(timestamps)}")
-            print(f"  Average interval: {avg_interval*1000:.2f}ms")
-            print(f"  Min interval: {min_interval*1000:.2f}ms ({1.0/min_interval:.1f} FPS)")
-            print(f"  Max interval: {max_interval*1000:.2f}ms ({1.0/max_interval:.1f} FPS)")
-            print(f"  Average FPS: {avg_fps:.1f}")
-            print(f"  Jitter (std dev): {jitter*1000:.2f}ms")
-            print(f"  Total duration: {timestamps[-1] - timestamps[0]:.2f}s")
+            timing_stats = analyze_frame_timing(timestamps, detected_fps)
+            
+            print(f"\n{'='*60}")
+            print(f"FRAME TIMING ANALYSIS")
+            print(f"{'='*60}")
+            
+            print(f"\nBasic Statistics:")
+            print(f"  Total frames: {timing_stats['count']}")
+            print(f"  Total duration: {timing_stats['total_duration']:.3f}s")
+            print(f"  Average FPS: {timing_stats['avg_fps']:.2f} Hz")
+            print(f"  Detected FPS: {timing_stats['detected_fps']:.2f} Hz")
+            
+            print(f"\nInterval Statistics:")
+            print(f"  Average: {timing_stats['avg_interval']*1000:.3f}ms")
+            print(f"  Median:  {timing_stats['median_interval']*1000:.3f}ms")
+            print(f"  Min:     {timing_stats['min_interval']*1000:.3f}ms ({1.0/timing_stats['min_interval']:.1f} FPS)")
+            print(f"  Max:     {timing_stats['max_interval']*1000:.3f}ms ({1.0/timing_stats['max_interval']:.1f} FPS)")
+            print(f"  Std Dev: {timing_stats['std_interval']*1000:.3f}ms")
+            
+            print(f"\nTiming Quality Metrics:")
+            print(f"  Jitter (std dev): {timing_stats['jitter_ms']:.3f}ms")
+            print(f"  Coefficient of Variation: {timing_stats['cv']:.4f}")
+            print(f"  Stability (±10% tolerance): {timing_stats['stability_pct']:.1f}%")
+            
+            print(f"\nOutlier & Drop Detection:")
+            print(f"  Outlier intervals: {timing_stats['outlier_count']} ({timing_stats['outlier_pct']:.1f}%)")
+            print(f"  Detected frame drops: {timing_stats['drop_count']} ({timing_stats['drop_pct']:.1f}%)")
+            print(f"  Estimated total drops: {timing_stats['estimated_drops']}")
+            
+            # Quality assessment
+            if timing_stats['jitter_ms'] < 1.0 and timing_stats['stability_pct'] > 95:
+                quality = "EXCELLENT"
+            elif timing_stats['jitter_ms'] < 3.0 and timing_stats['stability_pct'] > 85:
+                quality = "GOOD"
+            elif timing_stats['jitter_ms'] < 5.0 and timing_stats['stability_pct'] > 70:
+                quality = "FAIR"
+            else:
+                quality = "POOR"
+            
+            print(f"\nOverall Timing Quality: {quality}")
+            
+            # Recommendations
+            if timing_stats['jitter_ms'] > 5.0:
+                print(f"\n⚠️  HIGH JITTER DETECTED:")
+                print(f"   - Consider thread pinning (--cpu-core)")
+                print(f"   - Run with sudo for real-time priority")
+                print(f"   - Check system load during capture")
+            
+            if timing_stats['drop_pct'] > 5.0:
+                print(f"\n⚠️  FREQUENT FRAME DROPS:")
+                print(f"   - Reduce processing overhead")
+                print(f"   - Check camera/USB bandwidth")
+                print(f"   - Monitor CPU temperature throttling")
+            
+            print(f"{'='*60}\n")
         else:
             print(f"\nFrame Timing:")
             print(f"  No timestamp data available (recorded before timestamp feature)")

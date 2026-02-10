@@ -120,11 +120,11 @@ class PhaseController:
         # USB polling process (separate process = no GIL contention)
         self._polling_process = None
         self._stop_polling = multiprocessing.Event()
-        # Fast polling all the time to catch phase transitions accurately
-        # Must poll quickly during RECOVERY/IDLE to detect DRIVE start immediately
-        # Otherwise 200ms delay = 12 frames missed @ 60fps
-        self._poll_interval_idle = 0.04  # 40ms polling always (was 200ms - too slow for transitions)
-        self._poll_interval_drive = 0.04  # 40ms polling during Drive (for force capture)
+        # CSAFE SPEC COMPLIANT: 100ms (10Hz) polling
+        # CSAFE spec requires 50-100ms between frames
+        # Using max 100ms for reliable PM5 communication
+        self._poll_interval_idle = 0.100  # 100ms polling (10Hz)
+        self._poll_interval_drive = 0.100  # Same during drive
         self._last_phase = StrokePhase.IDLE  # Track phase transitions
         
         LOG.info("PhaseController initialized for ergometer phase detection (multiprocessing mode)")

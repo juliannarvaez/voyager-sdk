@@ -15,6 +15,8 @@ import time
 import json
 from datetime import datetime
 from pathlib import Path
+import ctypes
+import threading
 
 if not os.environ.get('AXELERA_FRAMEWORK'):
     sys.exit("Please activate the Axelera environment with source venv/bin/activate and run again")
@@ -40,6 +42,44 @@ import numpy as np
 
 LOG = logging_utils.getLogger(__name__)
 PBAR = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
+
+
+def setup_capture_thread_priority(cpu_core=3):
+    """
+    Pin capture thread to dedicated CPU core and increase priority.
+    
+    Args:
+        cpu_core: CPU core to pin to (default: 3 for RPI 5's last core)
+    """
+    try:
+        # Get current thread/process ID
+        tid = threading.get_native_id()
+        
+        # Set CPU affinity - pin to specific core
+        os.sched_setaffinity(0, {cpu_core})
+        LOG.info(f"Pinned capture thread to CPU core {cpu_core}")
+        
+        # Increase thread priority using nice value (lower = higher priority)
+        # Range: -20 (highest) to 19 (lowest), default is 0
+        try:
+            current_nice = os.nice(0)
+            os.nice(-10)  # Increase priority (requires root or CAP_SYS_NICE)
+            LOG.info(f"Increased thread priority (nice: {current_nice} -> {current_nice - 10})")
+        except PermissionError:
+            LOG.warning("Cannot set priority (need sudo for nice < 0). Running with default priority.")
+        
+        # Alternative: Try to set real-time scheduling policy (requires root)
+        try:
+            # SCHED_FIFO = 1, priority range 1-99 (higher = higher priority)
+            param = os.sched_param(50)  # Medium-high RT priority
+            os.sched_setscheduler(0, os.SCHED_FIFO, param)
+            LOG.info("Set real-time FIFO scheduling policy (priority 50)")
+        except (PermissionError, AttributeError, OSError):
+            # Not available or no permission - continue with nice value
+            pass
+            
+    except Exception as e:
+        LOG.warning(f"Could not optimize thread settings: {e}. Continuing with defaults.")
 
 
 def create_output_dir(base_path):
@@ -127,6 +167,9 @@ def record_keypoints_inference(args, stream, output_dir, max_frames):
     """Record frames with keypoint inference."""
     output_dir, timing_file, keypoints_dir = create_output_dir(output_dir)
     
+    # Optimize capture thread for low-latency, consistent timing
+    setup_capture_thread_priority(cpu_core=getattr(args, 'cpu_core', 3))
+    
     print(f"Recording keypoint detections to: {output_dir}")
     print(f"Press Ctrl+C to stop recording (max {max_frames} frames)")
     
@@ -209,6 +252,12 @@ def main():
         type=int,
         default=300,
         help='Maximum number of frames to record'
+    )
+    parser.add_argument(
+        '--cpu-core',
+        type=int,
+        default=3,
+        help='CPU core to pin capture thread to (0-3 for RPI 5, default: 3)'
     )
     
     args = parser.parse_args()
