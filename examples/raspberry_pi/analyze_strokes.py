@@ -39,31 +39,62 @@ FILE_PATTERN = "stroke_*.json"
 current_index = [0]
 
 
-def compute_frequency_response(timestamps, velocity):
+def compute_acceleration(velocity, timestamps=None, fps=60):
     """
-    Compute frequency response using FFT.
+    Compute acceleration from velocity data using central differences.
     
     Args:
-        timestamps: Array of timestamps (seconds)
-        velocity: Array of velocity values (px/s)
+        velocity: Array of velocity values (m/s or px/s)
+        timestamps: Optional array of actual timestamps
+        fps: Frames per second (used if timestamps not provided)
         
     Returns:
-        frequencies (Hz), power spectral density (dB)
+        Array of accelerations (m/s² or px/s²)
     """
-    # Compute sampling rate
-    dt = np.mean(np.diff(timestamps))
-    fs = 1.0 / dt  # Sampling frequency
-    
-    # Compute FFT
+    velocity = np.array(velocity, dtype=float)
     n = len(velocity)
-    fft_values = np.fft.rfft(velocity)
-    fft_freq = np.fft.rfftfreq(n, dt)
+    if n < 2:
+        return np.array([])
     
-    # Power spectral density in dB
-    psd = np.abs(fft_values) ** 2
-    psd_db = 10 * np.log10(psd + 1e-12)  # Add epsilon to avoid log(0)
+    accelerations = np.zeros(n)
     
-    return fft_freq, psd_db
+    if timestamps is not None and len(timestamps) == n:
+        # Use actual timestamps for each interval
+        timestamps = np.array(timestamps)
+        
+        # Central differences for interior points
+        for i in range(1, n - 1):
+            dt = timestamps[i + 1] - timestamps[i - 1]
+            if dt > 0:
+                accelerations[i] = (velocity[i + 1] - velocity[i - 1]) / dt
+            else:
+                accelerations[i] = np.nan
+        
+        # Forward difference for first point
+        dt0 = timestamps[1] - timestamps[0]
+        if dt0 > 0:
+            accelerations[0] = (velocity[1] - velocity[0]) / dt0
+        else:
+            accelerations[0] = accelerations[1] if n > 1 else 0
+        
+        # Backward difference for last point
+        dt_last = timestamps[-1] - timestamps[-2]
+        if dt_last > 0:
+            accelerations[-1] = (velocity[-1] - velocity[-2]) / dt_last
+        else:
+            accelerations[-1] = accelerations[-2] if n > 1 else 0
+    else:
+        # Use constant fps
+        dt = 1.0 / fps
+        
+        # Central differences for interior points
+        accelerations[1:-1] = (velocity[2:] - velocity[:-2]) / (2 * dt)
+        
+        # Forward/backward for endpoints
+        accelerations[0] = (velocity[1] - velocity[0]) / dt if n > 1 else 0
+        accelerations[-1] = (velocity[-1] - velocity[-2]) / dt if n > 1 else 0
+    
+    return accelerations
 
 
 def compute_angle(a, b, c):
@@ -1018,110 +1049,261 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     ax2.set_title('Joint Speed (√(vx² + vy²))', fontsize=12)
     ax2.legend(loc='best', fontsize=8)
     ax2.grid(True, alpha=0.3)
+
+    # === VELOCITY-ONLY SEQUENCING REPORT ===
+    # Uses speed magnitudes only (no acceleration) and phases if available.
+    try:
+        speed_series = {
+            'Knee': np.array(knee_speed_smooth, dtype=float),
+            'Hip': np.array(hip_speed_smooth, dtype=float),
+            'Shoulder': np.array(shoulder_speed_smooth, dtype=float),
+            'Right Wrist': np.array(right_wrist_speed_smooth, dtype=float),
+            'Ankle': np.array(ankle_speed_smooth, dtype=float),
+        }
+
+        timestamps_arr = np.array(data.get('timestamps', []), dtype=float)
+        detected_fps_val = float(data.get('detected_fps', 0) or 0)
+
+        def _time_axis(n: int):
+            if len(timestamps_arr) == n and np.all(np.diff(timestamps_arr) > 0):
+                return timestamps_arr, 'Time(s)'
+            if detected_fps_val > 0:
+                return np.arange(n, dtype=float) / detected_fps_val, 'Time(s)'
+            return np.arange(n, dtype=float), 'Frame'
+
+        def _safe_nanargmax(x: np.ndarray):
+            if x.size == 0 or np.all(np.isnan(x)):
+                return None
+            return int(np.nanargmax(x))
+
+        def _onset_index(speed: np.ndarray, seg_start: int, seg_end: int, peak_idx: int, frac: float = 0.10):
+            # Onset = first time in segment that rises above baseline + frac*(peak-baseline)
+            # Baseline from a short window just before segment start when available.
+            n = len(speed)
+            seg_start = int(max(0, min(seg_start, n - 1)))
+            seg_end = int(max(seg_start, min(seg_end, n - 1)))
+            peak_idx = int(max(seg_start, min(peak_idx, seg_end)))
+
+            pre_start = max(0, seg_start - max(5, int(0.1 * n)))
+            baseline_window = speed[pre_start:seg_start]
+            if baseline_window.size == 0 or np.all(np.isnan(baseline_window)):
+                baseline = float(np.nanmedian(speed[seg_start:seg_end + 1]))
+            else:
+                baseline = float(np.nanmedian(baseline_window))
+
+            peak_val = float(speed[peak_idx])
+            if np.isnan(peak_val) or np.isnan(baseline):
+                return None, np.nan
+            threshold = baseline + frac * (peak_val - baseline)
+            segment = speed[seg_start:seg_end + 1]
+            hit = np.where(segment >= threshold)[0]
+            if hit.size == 0:
+                return None, threshold
+            return int(seg_start + hit[0]), threshold
+
+        n_frames = len(frames)
+        t_axis, t_label = _time_axis(n_frames)
+
+        phases_arr = np.array(phases, dtype=int) if len(phases) == n_frames else None
+        if phases_arr is not None and np.any(phases_arr == 2):
+            drive_idxs = np.where(phases_arr == 2)[0]
+            drive_start = int(drive_idxs[0])
+            drive_end = int(drive_idxs[-1])
+            segment_name = 'DRIVE'
+        else:
+            drive_start = 0
+            drive_end = n_frames - 1
+            segment_name = 'FULL'
+
+        print(f"\n{'='*60}")
+        print("VELOCITY SEQUENCING (speed-only)")
+        print(f"Segment: {segment_name} frames [{drive_start}..{drive_end}] (n={drive_end - drive_start + 1})")
+        if t_label == 'Time(s)':
+            try:
+                seg_dur = float(t_axis[drive_end] - t_axis[drive_start])
+                print(f"Segment duration: {seg_dur:.3f} s")
+            except Exception:
+                pass
+
+        joint_peak = {}
+        joint_onset = {}
+        for joint, spd in speed_series.items():
+            if len(spd) != n_frames:
+                continue
+            seg = spd[drive_start:drive_end + 1]
+            peak_rel = _safe_nanargmax(seg)
+            if peak_rel is None:
+                continue
+            peak_idx = drive_start + peak_rel
+            peak_val = float(spd[peak_idx])
+            peak_time = float(t_axis[peak_idx]) if peak_idx < len(t_axis) else float(peak_idx)
+            onset_idx, onset_thr = _onset_index(spd, drive_start, drive_end, peak_idx, frac=0.10)
+            onset_time = float(t_axis[onset_idx]) if onset_idx is not None and onset_idx < len(t_axis) else np.nan
+
+            joint_peak[joint] = {
+                'idx': peak_idx,
+                't': peak_time,
+                'v': peak_val,
+            }
+            joint_onset[joint] = {
+                'idx': onset_idx,
+                't': onset_time,
+                'thr': float(onset_thr) if onset_thr is not None else np.nan,
+            }
+
+        # Print per-joint peak and onset
+        print(f"\n{'Joint':12s} {'PeakFrame':>9s} {t_label:>10s} {'PeakV(px/s)':>12s} {'OnsetFr':>8s} {'OnsetT':>10s}")
+        print('-' * 68)
+        for joint in ['Knee', 'Hip', 'Shoulder', 'Right Wrist', 'Ankle']:
+            if joint not in joint_peak:
+                continue
+            p = joint_peak[joint]
+            o = joint_onset.get(joint, {})
+            onset_fr = o.get('idx', None)
+            onset_t = o.get('t', np.nan)
+            onset_fr_str = f"{onset_fr:d}" if onset_fr is not None else "-"
+            onset_t_str = f"{onset_t:10.3f}" if np.isfinite(onset_t) and t_label == 'Time(s)' else (f"{onset_t:10.0f}" if np.isfinite(onset_t) else "         -")
+            peak_t_str = f"{p['t']:10.3f}" if t_label == 'Time(s)' else f"{p['idx']:10d}"
+            print(f"{joint:12s} {p['idx']:9d} {peak_t_str} {p['v']:12.2f} {onset_fr_str:>8s} {onset_t_str}")
+
+        # Peak ordering and simple lead/lag diagnostics
+        if len(joint_peak) >= 2:
+            peak_order = sorted([(info['idx'], joint) for joint, info in joint_peak.items()])
+            order_str = ' → '.join([j for _, j in peak_order])
+            print(f"\nPeak speed order (earlier→later): {order_str}")
+
+            def _delta(j1: str, j2: str):
+                if j1 not in joint_peak or j2 not in joint_peak:
+                    return None
+                df = joint_peak[j2]['idx'] - joint_peak[j1]['idx']
+                if t_label == 'Time(s)':
+                    try:
+                        dt = joint_peak[j2]['t'] - joint_peak[j1]['t']
+                    except Exception:
+                        dt = None
+                else:
+                    dt = None
+                return df, dt
+
+            wrist_vs_knee = _delta('Knee', 'Right Wrist')
+            shoulder_vs_hip = _delta('Hip', 'Shoulder')
+
+            if wrist_vs_knee is not None:
+                df, dt = wrist_vs_knee
+                if dt is not None:
+                    print(f"Wrist peak after knee peak: {df:+d} frames ({dt:+.3f} s)")
+                else:
+                    print(f"Wrist peak after knee peak: {df:+d} frames")
+                if df < 0:
+                    print("Heuristic: wrist peaking before knee can indicate early arms (or tracking/camera effects).")
+
+            if shoulder_vs_hip is not None:
+                df, dt = shoulder_vs_hip
+                if dt is not None:
+                    print(f"Shoulder peak after hip peak: {df:+d} frames ({dt:+.3f} s)")
+                else:
+                    print(f"Shoulder peak after hip peak: {df:+d} frames")
+                if df < 0:
+                    print("Heuristic: shoulder peaking before hip can indicate early back opening.")
+
+        print(f"{'='*60}\n")
+    except Exception as e:
+        print(f"\nVelocity sequencing report error: {e}\n")
     
-    # Plot 3: Frequency Response of All Right-Side Joints
-    filter_type = data.get('filter_type', 'unknown')
+    # Plot 3: Keypoint Acceleration
     timestamps = data['timestamps']
     
-    # Compute frequency response for all right-side joints
+    # Compute acceleration for all right-side joints
     try:
-        dt = np.mean(np.diff(timestamps))
-        fs = 1.0 / dt  # Sampling frequency
+        # Compute acceleration from speed (magnitude)
+        shoulder_accel = compute_acceleration(shoulder_speed_smooth, timestamps)
+        hip_accel = compute_acceleration(hip_speed_smooth, timestamps)
+        knee_accel = compute_acceleration(knee_speed_smooth, timestamps)
+        ankle_accel = compute_acceleration(ankle_speed_smooth, timestamps)
+        wrist_accel = compute_acceleration(right_wrist_speed_smooth, timestamps)
         
-        # Compute frequency response for each joint
-        freq_shoulder, psd_shoulder = compute_frequency_response(timestamps, shoulder_speed_smooth)
-        freq_hip, psd_hip = compute_frequency_response(timestamps, hip_speed_smooth)
-        freq_knee, psd_knee = compute_frequency_response(timestamps, knee_speed_smooth)
-        freq_ankle, psd_ankle = compute_frequency_response(timestamps, ankle_speed_smooth)
-        freq_wrist, psd_wrist = compute_frequency_response(timestamps, right_wrist_speed_smooth)
-        freq_elbow, psd_elbow = compute_frequency_response(timestamps, right_elbow_speed_smooth)
-        
-        # Sum all frequency responses (convert from dB back to linear, sum, then back to dB)
-        psd_linear_sum = (10**(psd_shoulder/10) + 10**(psd_hip/10) + 10**(psd_knee/10) + 
-                          10**(psd_ankle/10) + 10**(psd_wrist/10) + 10**(psd_elbow/10))
-        psd_sum = 10 * np.log10(psd_linear_sum)
-        
-        # === FREQUENCY ANALYSIS LOGGING ===
+        # === ACCELERATION ANALYSIS LOGGING ===
         print(f"\n{'='*60}")
-        print(f"FREQUENCY RESPONSE ANALYSIS")
+        print(f"ACCELERATION ANALYSIS")
         print(f"{'='*60}")
-        print(f"Sampling rate: {fs:.1f} Hz")
-        print(f"Filter type: {filter_type}")
         print(f"Stroke file: {os.path.basename(filepath)}")
         
-        # Find dominant frequency in summed response (skip DC component at index 0)
-        freq_range_mask = (freq_shoulder[1:] > 0.1) & (freq_shoulder[1:] < 2.0)  # Focus on stroke rate range
-        if np.any(freq_range_mask):
-            dominant_idx = np.argmax(psd_sum[1:][freq_range_mask])
-            dominant_freq = freq_shoulder[1:][freq_range_mask][dominant_idx]
-            dominant_power = psd_sum[1:][freq_range_mask][dominant_idx]
-            stroke_rate_spm = dominant_freq * 60  # Convert Hz to strokes per minute
-            print(f"\nDominant Frequency: {dominant_freq:.3f} Hz ({stroke_rate_spm:.1f} SPM)")
-            print(f"  Power at dominant: {dominant_power:.1f} dB")
-        
-        # Analyze power in different frequency bands
-        bands = [
-            ("Stroke Rate (0.2-1 Hz)", 0.2, 1.0),
-            ("Low Motion (1-3 Hz)", 1.0, 3.0),
-            ("Mid Motion (3-5 Hz)", 3.0, 5.0),
-            ("High Freq Noise (5-10 Hz)", 5.0, 10.0),
-            ("Very High Noise (10-20 Hz)", 10.0, 20.0)
-        ]
-        
-        print(f"\nPower Distribution by Frequency Band:")
-        for band_name, f_low, f_high in bands:
-            band_mask = (freq_shoulder[1:] >= f_low) & (freq_shoulder[1:] < f_high)
-            if np.any(band_mask):
-                avg_power = np.mean(psd_sum[1:][band_mask])
-                max_power = np.max(psd_sum[1:][band_mask])
-                print(f"  {band_name:25s}: avg={avg_power:6.1f} dB, max={max_power:6.1f} dB")
-        
-        # Per-joint dominant frequencies
-        print(f"\nPer-Joint Dominant Frequencies (0.1-2 Hz range):")
+        # Compute statistics for each joint
         joint_data = [
-            ("Shoulder", psd_shoulder),
-            ("Hip", psd_hip),
-            ("Knee", psd_knee),
-            ("Ankle", psd_ankle),
-            ("Right Wrist", psd_wrist),
-            ("Right Elbow", psd_elbow)
+            ("Shoulder", shoulder_accel),
+            ("Hip", hip_accel),
+            ("Knee", knee_accel),
+            ("Ankle", ankle_accel),
+            ("Right Wrist", wrist_accel)
         ]
-        for joint_name, psd in joint_data:
-            if np.any(freq_range_mask):
-                idx = np.argmax(psd[1:][freq_range_mask])
-                freq = freq_shoulder[1:][freq_range_mask][idx]
-                power = psd[1:][freq_range_mask][idx]
-                print(f"  {joint_name:12s}: {freq:.3f} Hz ({freq*60:.1f} SPM), power={power:.1f} dB")
         
+        print(f"\nPer-Joint Acceleration Statistics (px/s²):")
+        for joint_name, accel in joint_data:
+            valid_accel = accel[~np.isnan(accel)]
+            if len(valid_accel) > 0:
+                max_accel = np.max(np.abs(valid_accel))
+                mean_accel = np.mean(np.abs(valid_accel))
+                std_accel = np.std(valid_accel)
+                print(f"  {joint_name:12s}: max={max_accel:8.1f}, mean={mean_accel:8.1f}, std={std_accel:8.1f}")
+        
+        # === DETAILED DATA TABLE ===
+        print(f"\n{'='*60}")
+        print(f"DETAILED KEYPOINT DATA TABLE (All frames)")
         print(f"{'='*60}\n")
         
-        # Plot summed frequency response (thicker, prominent)
-        ax3.plot(freq_shoulder[1:], psd_sum[1:], 'black', linewidth=3, label='Sum (All Joints)', alpha=0.9)
+        # Show data for each joint
+        for joint_name, accel_data in joint_data:
+            # Get corresponding position and velocity data
+            if joint_name == "Shoulder":
+                pos_x, pos_y = shoulder_x_smooth, shoulder_y_smooth
+                vel = shoulder_speed_smooth
+            elif joint_name == "Hip":
+                pos_x, pos_y = hip_x_smooth, hip_y_smooth
+                vel = hip_speed_smooth
+            elif joint_name == "Knee":
+                pos_x, pos_y = knee_x_smooth, knee_y_smooth
+                vel = knee_speed_smooth
+            elif joint_name == "Ankle":
+                pos_x, pos_y = ankle_x_smooth, ankle_y_smooth
+                vel = ankle_speed_smooth
+            else:  # Right Wrist
+                pos_x, pos_y = right_wrist_x_smooth, right_wrist_y_smooth
+                vel = right_wrist_speed_smooth
+            
+            print(f"\n{joint_name}:")
+            print(f"{'Frame':>6} {'Time(s)':>8} {'Pos_X(px)':>11} {'Pos_Y(px)':>11} {'Vel(px/s)':>12} {'Accel(px/s²)':>14}")
+            print(f"{'-'*70}")
+            
+            # Show all frames
+            for i in range(len(timestamps)):
+                time_val = timestamps[i]
+                pos_x_val = pos_x[i]
+                pos_y_val = pos_y[i]
+                vel_val = vel[i]
+                accel_val = accel_data[i]
+                print(f"{i:6d} {time_val:8.3f} {pos_x_val:11.2f} {pos_y_val:11.2f} {vel_val:12.2f} {accel_val:14.2f}")
         
-        # Plot all joints overlayed (thinner, more transparent)
-        ax3.plot(freq_shoulder[1:], psd_shoulder[1:], 'purple', linewidth=1.5, label='Shoulder', alpha=0.5)
-        ax3.plot(freq_hip[1:], psd_hip[1:], 'blue', linewidth=1.5, label='Hip', alpha=0.5)
-        ax3.plot(freq_knee[1:], psd_knee[1:], 'green', linewidth=1.5, label='Knee', alpha=0.5)
-        ax3.plot(freq_ankle[1:], psd_ankle[1:], 'orange', linewidth=1.5, label='Ankle', alpha=0.5)
-        ax3.plot(freq_wrist[1:], psd_wrist[1:], 'red', linewidth=1.5, label='Right Wrist', alpha=0.5)
-        ax3.plot(freq_elbow[1:], psd_elbow[1:], 'brown', linewidth=1.5, label='Right Elbow', alpha=0.5)
+        print(f"\n{'='*60}\n")
         
-        ax3.set_xlabel('Frequency (Hz)', fontsize=10)
-        ax3.set_ylabel('Power (dB)', fontsize=10)
-        ax3.set_title(f'Joint Velocity Frequency Response ({filter_type} filter)', fontsize=12)
-        ax3.set_xlim([0, min(fs/2, 30)])  # Show up to Nyquist or 30 Hz
+        # Plot all joints acceleration
+        ax3.plot(frames, shoulder_accel, 'purple', linewidth=2, label='Shoulder', alpha=0.8)
+        ax3.plot(frames, hip_accel, 'blue', linewidth=2, label='Hip', alpha=0.8)
+        ax3.plot(frames, knee_accel, 'green', linewidth=2, label='Knee', alpha=0.8)
+        ax3.plot(frames, ankle_accel, 'orange', linewidth=2, label='Ankle', alpha=0.8)
+        ax3.plot(frames, wrist_accel, 'red', linewidth=2, label='Right Wrist', alpha=0.8)
+        
+        # Add zero reference line
+        ax3.axhline(y=0, color='black', linestyle='--', linewidth=1, alpha=0.3)
+        
+        ax3.set_xlabel('Frame', fontsize=10)
+        ax3.set_ylabel('Acceleration (px/s²)', fontsize=10)
+        ax3.set_title('Joint Acceleration', fontsize=12)
         ax3.grid(True, alpha=0.3)
         ax3.legend(loc='best', fontsize=8)
-        
-        # Add text with filter info
-        info_text = f"Fs: {fs:.1f} Hz\nFilter: {filter_type}"
-        ax3.text(0.98, 0.98, info_text, transform=ax3.transAxes,
-                fontsize=8, verticalalignment='top', horizontalalignment='right',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     except Exception as e:
-        ax3.text(0.5, 0.5, f'Error computing frequency response:\n{str(e)}', 
+        ax3.text(0.5, 0.5, f'Error computing acceleration:\n{str(e)}', 
                 ha='center', va='center', transform=ax3.transAxes, fontsize=10)
-        ax3.set_title('Frequency Response (Error)', fontsize=12)
+        ax3.set_title('Acceleration (Error)', fontsize=12)
     
     # Plot 4: Force Curve (only during drive phase)
     force_curve = data.get('force_curve', [])  # parse_stroke_file returns 'force_curve'

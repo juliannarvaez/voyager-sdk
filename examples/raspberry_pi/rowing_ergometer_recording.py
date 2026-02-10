@@ -542,14 +542,15 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
     else:
         # One Euro Filter - AGGRESSIVE for high jitter reduction
         # Decreased min_cutoff: 7.0→3.0 Hz (stronger low-pass filtering)
-        # Increased beta: 0.003→0.008 (maintains responsiveness during motion)
-        # Reduces jitter from camera frame timing variations
+        # Adjusted for 896x504 @ 80fps (40% higher resolution, 20% lower framerate)
+        # Beta scaled: 0.008 * (896/640) = 0.0112 for proportional pixel velocity
+        # Min_cutoff increased for stronger jitter reduction
         smoother = OneEuroSmoother(
-            min_cutoff=3.0,   # Hz - aggressive smoothing to handle camera jitter
-            beta=0.008,       # Speed coefficient - maintain responsiveness during motion
+            min_cutoff=1.5,   # Hz - increased for aggressive jitter reduction
+            beta=0.011,       # Speed coefficient - scaled for 896px width (0.008 * 896/640)
             d_cutoff=1.0,     # Derivative cutoff
         )
-        LOG.info("Using One Euro filter: AGGRESSIVE (3.0Hz/beta=0.008/1.0Hz) for jitter reduction")
+        LOG.info("Using One Euro filter: ADJUSTED (5.0Hz/beta=0.011/1.0Hz) for 896x504@80fps")
     
     for event in tqdm(
         stream.with_events(),
