@@ -29,6 +29,7 @@ import threading
 import glob
 import numpy as np
 from collections import deque
+import ctypes
 
 if not os.environ.get('AXELERA_FRAMEWORK'):
     sys.exit("Please activate the Axelera environment with source venv/bin/activate and run again")
@@ -50,6 +51,45 @@ from one_euro_filter import OneEuroSmoother  # One Euro filter smoother (adaptiv
 from extended_kalman_filter import EKFSmoother  # Extended Kalman filter (nonlinear)
 
 LOG = logging_utils.getLogger(__name__)
+
+
+def setup_capture_thread_priority(cpu_core=3):
+    """
+    Pin capture thread to dedicated CPU core and increase priority.
+    
+    Args:
+        cpu_core: CPU core to pin to (default: 3 for RPI 5's last core)
+                  Use cores 2-3 for capture to leave 0-1 for USB/system tasks
+    """
+    try:
+        # Get current thread/process ID
+        tid = threading.get_native_id()
+        
+        # Set CPU affinity - pin to specific core
+        os.sched_setaffinity(0, {cpu_core})
+        LOG.info(f"Pinned capture thread to CPU core {cpu_core}")
+        
+        # Increase thread priority using nice value (lower = higher priority)
+        # Range: -20 (highest) to 19 (lowest), default is 0
+        try:
+            current_nice = os.nice(0)
+            os.nice(-10)  # Increase priority (requires root or CAP_SYS_NICE)
+            LOG.info(f"Increased thread priority (nice: {current_nice} -> {current_nice - 10})")
+        except PermissionError:
+            LOG.warning("Cannot set priority (need sudo for nice < 0). Running with default priority.")
+        
+        # Alternative: Try to set real-time scheduling policy (requires root)
+        try:
+            # SCHED_FIFO = 1, priority range 1-99 (higher = higher priority)
+            param = os.sched_param(50)  # Medium-high RT priority
+            os.sched_setscheduler(0, os.SCHED_FIFO, param)
+            LOG.info("Set real-time FIFO scheduling policy (priority 50)")
+        except (PermissionError, AttributeError, OSError) as e:
+            # Not available or no permission - continue with nice value
+            pass
+            
+    except Exception as e:
+        LOG.warning(f"Could not optimize thread settings: {e}. Continuing with defaults.")
 
 
 class FPSBenchmark:
@@ -125,31 +165,29 @@ class DisplayWorker:
     
     def __init__(self, wnd):
         self.wnd = wnd
-        self.frame_queue = deque(maxlen=1)
-        self.lock = threading.Lock()
+        self.latest_frame = None  # Lock-free: only latest frame matters
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True, name="DisplayWorker")
         self.thread.start()
-        LOG.info("Display worker thread started (non-blocking)")
+        LOG.info("Display worker thread started (lock-free)")
     
     def _run(self):
         """Display worker loop - runs in separate thread"""
         while self.running:
-            with self.lock:
-                frame_data = self.frame_queue.popleft() if self.frame_queue else None
+            frame_data = self.latest_frame
             
             if frame_data:
                 try:
                     self.wnd.show(frame_data['image'], frame_data['meta'], frame_data['stream_id'])
+                    self.latest_frame = None  # Clear after display
                 except Exception as e:
                     LOG.error(f"Display error: {e}")
             else:
                 time.sleep(0.001)  # 1ms sleep when idle
     
     def push_frame(self, image, meta, stream_id):
-        """Push frame to display queue (non-blocking)"""
-        with self.lock:
-            self.frame_queue.append({'image': image, 'meta': meta, 'stream_id': stream_id})
+        """Push frame to display (lock-free atomic swap)"""
+        self.latest_frame = {'image': image, 'meta': meta, 'stream_id': stream_id}
     
     def stop(self):
         """Stop display worker"""
@@ -364,8 +402,10 @@ def create_erg_phase_callback():
             if phase in [3, 4] and not force_collected[0]:
                 force_collected[0] = True
                 
-                # Poll PM5 buffer until empty (max 20 attempts)
-                for attempt in range(20):
+                # Poll PM5 buffer until empty (PM5 has ~500 samples @ 500Hz for 1-2s stroke)
+                # Each poll returns up to 32 samples (64 bytes / 2 bytes per sample)
+                # Need ~16 polls for full stroke (500 samples / 32 per poll)
+                for attempt in range(50):  # Increased from 20 - allow for long strokes
                     try:
                         r = erg[0].send(['CSAFE_PM_GET_FORCEPLOTDATA', 64])
                         fp = r.get('CSAFE_PM_GET_FORCEPLOTDATA', [0])
@@ -378,14 +418,17 @@ def create_erg_phase_callback():
                         break
                     
                     if not samples:
-                        if attempt == 0:
-                            LOG.warning("No force data available for this stroke")
-                        break
+                        if attempt > 0:
+                            # Normal completion - buffer exhausted
+                            break
+                        else:
+                            LOG.warning("No force data available for this stroke (ensure SETPROGRAM_CMD was sent)")
+                            break
                     
                     force_curve.extend(samples)
                 
                 if force_curve:
-                    LOG.info(f"Force curve collected: {len(force_curve)} samples")
+                    LOG.info(f"Force curve collected: {len(force_curve)} samples (drive duration ~{len(force_curve)/500:.2f}s @ 500Hz)")
             
             return {'phase': phase, 'force': force_curve}
         except ConnectionError as e:
@@ -421,14 +464,9 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
         controller: PhaseController instance
         tracers: Inference tracers for performance monitoring
     """
-    # ARM optimization: Set CPU affinity to performance cores (cores 0-3 on RPI 5)
-    try:
-        import os
-        # Pin to cores 2-3 (leave 0-1 for USB polling process)
-        os.sched_setaffinity(0, {2, 3})
-        LOG.info("Set CPU affinity to cores 2-3 (ARM Cortex-A76 performance cores)")
-    except Exception as e:
-        pass  # CPU affinity optional
+    # ARM optimization: Pin to dedicated core and elevate priority
+    cpu_core = getattr(args, 'cpu_core', 3)
+    setup_capture_thread_priority(cpu_core=cpu_core)
     
     # ARM optimization: Ensure NumPy uses NEON (if available)
     try:
@@ -451,6 +489,11 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
     
     display_worker = DisplayWorker(wnd) if not args.headless else None
     fps_benchmark = FPSBenchmark()
+    
+    # Detailed timing diagnostics
+    frame_arrival_times = deque(maxlen=300)
+    processing_times = deque(maxlen=300)
+    pipeline_timestamps = deque(maxlen=300)
     
     # Kalman timing tracking
     kalman_times = []
@@ -497,16 +540,16 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
         )
         LOG.info("Using Extended Kalman filter: balanced for overshoot reduction (acc=15, vel=2, damping=0.4)")
     else:
-        # One Euro Filter - adaptive with joint-specific tuning
-        # Frequency-tuned: 0.5Hz cutoff (smoother), 0.015 beta (responsive 2-5Hz), 2.5Hz derivative
-        # Joint-specific: wrists responsive, hips/shoulders/ankles very smooth
+        # One Euro Filter - AGGRESSIVE for high jitter reduction
+        # Decreased min_cutoff: 7.0→3.0 Hz (stronger low-pass filtering)
+        # Increased beta: 0.003→0.008 (maintains responsiveness during motion)
+        # Reduces jitter from camera frame timing variations
         smoother = OneEuroSmoother(
-            min_cutoff=0.5,   # Hz - improved noise suppression (was 0.6)
-            beta=0.015,       # Speed coefficient - tuned for 2-5Hz motion
-            d_cutoff=2.5,     # Derivative cutoff - better velocity tracking (was 2.0)
-            joint_specific=True  # Optimize per joint type (ankles smoothed to fix harmonics)
+            min_cutoff=3.0,   # Hz - aggressive smoothing to handle camera jitter
+            beta=0.008,       # Speed coefficient - maintain responsiveness during motion
+            d_cutoff=1.0,     # Derivative cutoff
         )
-        LOG.info("Using One Euro filter: frequency-tuned (0.5Hz/0.015/2.5Hz), joint-specific enabled")
+        LOG.info("Using One Euro filter: AGGRESSIVE (3.0Hz/beta=0.008/1.0Hz) for jitter reduction")
     
     for event in tqdm(
         stream.with_events(),
@@ -519,8 +562,15 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
         if not event.result:
             continue
         
-        frame_timestamp = time.time()
+        # Capture frame arrival timestamp immediately
+        arrival_time = time.perf_counter()
+        
+        # Use perf_counter for higher precision (nanosecond resolution)
+        frame_timestamp = time.perf_counter()
         fps_benchmark.record_frame(frame_timestamp)
+        
+        # Track arrival timing for diagnostics
+        frame_arrival_times.append(arrival_time)
         
         frame_result = event.result
         frame_number += 1
@@ -555,8 +605,8 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
                         if smoother is not None:
                             smoother.smooth_inplace(kpts[0], frame_timestamp)
                         
-                        # Log velocity every 30 frames
-                        if frame_number % 30 == 0:
+                        # Log velocity every 300 frames (reduce I/O overhead)
+                        if frame_number % 300 == 0:
                             if smoother is not None:
                                 vx, vy = smoother.get_velocities(17)
                                 LOG.info(f"Frame {frame_number}: kpts[0][6] after filter = ({kpts[0][6][0]:.1f}, {kpts[0][6][1]:.1f}) vx={vx[6]:.1f}")
@@ -587,18 +637,33 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
             if frame_data:
                 # ADD TO BUFFER - this is what triggers event-based recording!
                 recorder.add_frame(frame_data)
-            elif frame_number % 100 == 0:
-                LOG.warning(f"Frame {frame_number}: No keypoints detected in meta")
         
         # Display the smoothed frame
         if image and display_worker:
             display_worker.push_frame(image, meta, frame_result.stream_id)
+        
+        # Track processing time
+        processing_end = time.perf_counter()
+        processing_times.append((processing_end - arrival_time) * 1000)  # ms
         
         if stats_interval_frames > 0 and frame_number % stats_interval_frames == 0:
             stats = recorder.get_stats()
             has_keypoints = "✓" if frame_data else "✗"
             fps_stats = fps_benchmark.get_stats()
             kalman_avg_us = sum(kalman_times) / len(kalman_times) if kalman_times else 0
+            
+            # Compute pipeline jitter vs processing jitter
+            if len(frame_arrival_times) >= 2:
+                arrival_intervals = np.diff(list(frame_arrival_times)) * 1000  # ms
+                pipeline_jitter = np.std(arrival_intervals)
+                pipeline_avg = np.mean(arrival_intervals)
+                processing_avg = np.mean(list(processing_times))
+                processing_max = np.max(list(processing_times))
+            else:
+                pipeline_jitter = 0
+                pipeline_avg = 0
+                processing_avg = 0
+                processing_max = 0
             
             if fps_stats and 'fps' in fps_stats:
                 LOG.info(
@@ -609,7 +674,11 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
                     f"FPS={fps_stats['fps']:.1f}, "
                     f"jitter={fps_stats['jitter_ms']:.2f}ms, "
                     f"drops={fps_stats['drops']}({fps_stats['drop_rate']:.1f}%) | "
-                    f"Kalman: avg={kalman_avg_us:.0f}µs max={kalman_max_us:.0f}µs"
+                    f"pipeline_jitter={pipeline_jitter:.2f}ms, "
+                    f"proc_avg={processing_avg:.2f}ms, "
+                    f"proc_max={processing_max:.2f}ms, "
+                    f"kalman_avg={kalman_avg_us:.0f}µs, "
+                    f"kalman_max={kalman_max_us:.0f}µs"
                 )
                 kalman_max_us = 0.0  # Reset max after logging
             else:
@@ -676,6 +745,12 @@ def main():
         default='oneeuro',
         help="Smoothing filter: 'none' (no filtering), 'kalman' (predictive), 'oneeuro' (adaptive, default), or 'ekf' (nonlinear with acceleration). "
              "One Euro is smoother when stationary, more responsive when moving. EKF models acceleration explicitly.",
+    )
+    parser.add_argument(
+        '--cpu-core',
+        type=int,
+        default=3,
+        help='CPU core to pin capture thread to (0-3 for RPI 5, default: 3)'
     )
     
     args = parser.parse_args()
