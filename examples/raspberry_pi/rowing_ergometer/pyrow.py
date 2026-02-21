@@ -10,16 +10,24 @@
 """
 pyrow.py
 Interface to concept2 indoor rower
+
+Uses the Linux kernel HID driver via /dev/hidraw for proper multi-packet
+USB HID report handling.  This enables report ID #2 (121-byte frames,
+120 bytes CSAFE payload) instead of report ID #1 (21-byte frames, 20 bytes
+payload).  The kernel HID layer automatically splits/reassembles reports
+across multiple 64-byte USB transactions.
+
+Previous versions used pyusb which detaches the kernel driver and accesses
+raw USB endpoints, limiting each transfer to wMaxPacketSize (64 bytes) and
+breaking multi-packet HID reports.
 """
 
 import datetime
+import os
+import fcntl
 import time
 import sys
 import threading
-
-import usb.core
-import usb.util
-from usb import USBError
 
 try:
     from .csafe import csafe_cmd  # Relative import for package use
@@ -27,12 +35,20 @@ except (ImportError, ValueError):
     try:
         from csafe import csafe_cmd  # Direct import for script use
     except ImportError:
-        # Fallback for when csafe module isn't needed
         csafe_cmd = None
 
 C2_VENDOR_ID = 0x17a4
-MIN_FRAME_GAP = .100 # 100ms for PM5 firmware 459+ (spec is 50ms minimum)
+C2_PRODUCT_ID = 0x000a
+MIN_FRAME_GAP = .050  # 50ms — CSAFE spec minimum; kernel HID driver is reliable
 INTERFACE = 0
+
+# HID report sizes (from PM5 HID descriptor):
+#   Report ID 1:   20 data bytes + 1 ID byte =  21 bytes
+#   Report ID 2:  120 data bytes + 1 ID byte = 121 bytes  <-- default
+#   Report ID 4:  500 data bytes + 1 ID byte = 501 bytes  (firmware doesn't respond)
+REPORT_ID = 2
+REPORT_DATA_SIZE = 120  # CSAFE payload bytes for report ID #2
+REPORT_TOTAL_SIZE = REPORT_DATA_SIZE + 1  # including report ID byte
 
 ERG_MAPPING = {
     # List of stroke states
@@ -128,153 +144,226 @@ def get_pretty(data_dict, pretty):
                 try:
                     data_dict[key] = ERG_MAPPING[key][data_dict[key]]
                 except IndexError:
-                    # TODO, find exceptions and patch into ERG_MAPPING,found:
-                    # inttype 255
                     pass
-                    # print("IndexError")
     return data_dict
+
+
+def _find_hidraw_for_c2():
+    """
+    Scan /sys/class/hidraw/ to find the hidraw device node for a Concept2
+    ergometer.  Returns a list of /dev/hidrawN paths.
+    """
+    results = []
+    sysfs_base = '/sys/class/hidraw'
+    if not os.path.isdir(sysfs_base):
+        return results
+    for entry in sorted(os.listdir(sysfs_base)):
+        uevent_path = os.path.join(sysfs_base, entry, 'device', 'uevent')
+        if not os.path.exists(uevent_path):
+            continue
+        with open(uevent_path) as fp:
+            content = fp.read()
+        # HID_ID line looks like: HID_ID=0003:000017A4:0000000A
+        for line in content.splitlines():
+            if line.startswith('HID_ID='):
+                parts = line.split('=', 1)[1].split(':')
+                if len(parts) >= 3:
+                    vid = int(parts[1], 16)
+                    pid = int(parts[2], 16)
+                    if vid == C2_VENDOR_ID:
+                        devpath = f'/dev/{entry}'
+                        # Create the device node if it doesn't exist (Docker)
+                        if not os.path.exists(devpath):
+                            dev_file = os.path.join(sysfs_base, entry, 'dev')
+                            if os.path.exists(dev_file):
+                                with open(dev_file) as df:
+                                    major, minor = df.read().strip().split(':')
+                                try:
+                                    os.mknod(devpath, 0o666 | 0o020000,
+                                             os.makedev(int(major), int(minor)))
+                                except (OSError, PermissionError):
+                                    continue
+                        results.append(devpath)
+    return results
+
+
+def _reattach_kernel_driver():
+    """
+    If the kernel HID driver was previously detached (by pyusb), reattach it
+    so that /dev/hidrawN becomes available.  Requires pyusb to be installed.
+    """
+    try:
+        import usb.core
+        import usb.util
+        dev = usb.core.find(idVendor=C2_VENDOR_ID)
+        if dev is None:
+            return
+        try:
+            usb.util.release_interface(dev, INTERFACE)
+        except Exception:
+            pass
+        try:
+            if not dev.is_kernel_driver_active(INTERFACE):
+                dev.attach_kernel_driver(INTERFACE)
+        except Exception:
+            pass
+        # Give the kernel time to create the hidraw node
+        time.sleep(0.5)
+    except ImportError:
+        pass  # pyusb not installed — kernel driver should already be attached
+
 
 def find():
     """
-    Returns list of pyusb Devices which are ergs.
+    Returns list of hidraw device paths for connected Concept2 ergometers.
     """
-    try:
-        ergs = usb.core.find(find_all=True, idVendor=C2_VENDOR_ID)
-    except USBError as e:
-        # Errno 16: Resource busy - device exists but is in use
-        # Errno 19: No such device - device disconnected
-        # Don't raise on errno 16, just return empty (device will reconnect)
-        if e.errno == 16:
-            return []  # Return empty list, device busy
-        raise ConnectionRefusedError(f"USB error (errno {e.errno}): {e}")
-    if ergs is None:
-        raise ValueError('Ergs not found')
-    return ergs
+    paths = _find_hidraw_for_c2()
+    if not paths:
+        # Kernel driver may have been detached by a previous pyusb session
+        _reattach_kernel_driver()
+        paths = _find_hidraw_for_c2()
+    if not paths:
+        raise ValueError('Ergs not found — no /dev/hidraw device for Concept2. '
+                         'Is the PM5 connected via USB?')
+    return paths
 
-def find_all():
-    """
-    Scans all usb devices and lists everything found to stdout
-    :return: nothing
-    """
-    dev = usb.core.find(find_all=True)
-    for cfg in dev:
-        sys.stdout.write(
-            'VendorID = 0x{:04X}'.format(cfg.idVendor) + ' :: ProductID = 0x{:04X}'.format(cfg.idProduct) + '\n')
 
 class PyErg(object):
     """
-    Manages low-level erg communication
+    Manages low-level erg communication via Linux hidraw.
+
+    Uses the kernel HID driver which properly handles multi-packet USB
+    transfers, enabling report ID #2 (120 bytes CSAFE payload per frame)
+    instead of the 20-byte report ID #1.
     """
-    def __init__(self, erg):
+    def __init__(self, hidraw_path):
         """
-        Configures usb connection and sets erg value
+        Opens the hidraw device for read/write.
+
+        Parameters
+        ----------
+        hidraw_path : str
+            Path to /dev/hidrawN device, as returned by find().
         """
-        from warnings import warn
+        self._path = hidraw_path
+        self._fd = os.open(hidraw_path, os.O_RDWR)
 
-        if sys.platform != 'win32':
+        # Flush stale data from a previous session
+        # Set non-blocking temporarily
+        flags = fcntl.fcntl(self._fd, fcntl.F_GETFL)
+        fcntl.fcntl(self._fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        for _ in range(32):
             try:
-                if erg.is_kernel_driver_active(INTERFACE):
-                    erg.detach_kernel_driver(INTERFACE)
-            except Exception:
-                pass
-
-        # Release interface if already claimed (fixes "Resource busy" errors)
-        for attempt in range(5):
-            try:
-                usb.util.release_interface(erg, INTERFACE)
-                time.sleep(0.2 * (attempt + 1))
-            except:
-                pass
-        time.sleep(0.5)
-        
-        # Claim interface
-        try:
-            usb.util.claim_interface(erg, INTERFACE)
-        except USBError as e:
-            if e.errno == 16:  # Resource busy - retry after detaching driver
-                try:
-                    if sys.platform != 'win32' and erg.is_kernel_driver_active(INTERFACE):
-                        erg.detach_kernel_driver(INTERFACE)
-                except:
-                    pass
-                time.sleep(1.0)
-                usb.util.claim_interface(erg, INTERFACE)
-            else:
-                raise
-
-        # Set configuration only if needed
-        try:
-            current_config = erg.get_active_configuration()
-            if current_config is None or current_config.bConfigurationValue != 1:
-                erg.set_configuration()
-        except USBError as e:
-            if e.errno != 16:  # Ignore "Resource busy" - already configured
-                from warnings import warn
-                warn(f"USB error setting configuration: {e}")
-
-        self.erg = erg
-
-        configuration = erg[0]
-        iface = configuration[(0, 0)]
-        self.inEndpoint = iface[0].bEndpointAddress
-        self.outEndpoint = iface[1].bEndpointAddress
+                os.read(self._fd, 512)
+            except BlockingIOError:
+                break
+        # Restore blocking mode
+        fcntl.fcntl(self._fd, fcntl.F_SETFL, flags)
 
         self.__lastsend = datetime.datetime.now()
-        self.__send_lock = threading.Lock()  # Thread-safe USB access for PM5 firmware 459+
+        self.__send_lock = threading.Lock()
 
     def close(self):
-        """Release USB interface properly to avoid 'Resource busy' on reconnect"""
-        try:
-            if hasattr(self, 'erg'):
-                usb.util.release_interface(self.erg, INTERFACE)
-        except Exception:
-            pass  # Already released or device gone
+        """Close the hidraw file descriptor."""
+        if hasattr(self, '_fd') and self._fd >= 0:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = -1
 
     def __del__(self):
-        """Cleanup on deletion"""
         self.close()
 
     @staticmethod
     def _checkvalue(*args, **kwargs):
         return checkvalue(*args, **kwargs)
 
+    def _write_report(self, csafe_frame):
+        """
+        Wrap a CSAFE frame in a HID report and write to the device.
+        The frame must NOT include the report ID — this method adds it.
+        """
+        # Pad to full report size
+        data = csafe_frame + [0] * (REPORT_DATA_SIZE - len(csafe_frame))
+        buf = bytes([REPORT_ID]) + bytes(data)
+        os.write(self._fd, buf)
+
+    def _read_report(self, timeout_ms=2000):
+        """
+        Read one HID report from the device.
+
+        Returns the full report bytes including the report ID as byte[0].
+        On Linux hidraw with multi-report-ID devices, the kernel includes
+        the report ID in reads.
+        """
+        import select
+        # Use select for timeout (os.read on hidraw blocks forever)
+        r, _, _ = select.select([self._fd], [], [], timeout_ms / 1000.0)
+        if not r:
+            raise TimeoutError(f"PM5 read timeout ({timeout_ms}ms)")
+        data = os.read(self._fd, 512)
+        if not data:
+            raise ConnectionError("PM5 hidraw: empty read")
+        return data
+
     def send(self, message):
         """
-        Send CSAFE message to PM5 and return response.
+        Send CSAFE message to PM5 and return parsed response dict.
         Thread-safe with MIN_FRAME_GAP timing per CSAFE spec.
         """
         with self.__send_lock:
-            # Enforce MIN_FRAME_GAP between consecutive sends
             now = datetime.datetime.now()
             delta = (now - self.__lastsend).total_seconds()
             if delta < MIN_FRAME_GAP:
                 time.sleep(MIN_FRAME_GAP - delta)
 
-            # Send message
-            csafe = csafe_cmd.write(message)
+            csafe_frame = csafe_cmd.write(message)
             try:
-                self.erg.write(self.outEndpoint, csafe, timeout=2000)
-            except USBError as e:
-                if e.errno in (19, 110):  # No device / timeout
-                    raise ConnectionError(f"PM5 USB error ({e.errno}): disconnected or cable issue")
-                elif e.errno == 16:  # Resource busy
-                    raise ConnectionError(f"PM5 USB error ({e.errno}): device busy")
-                else:
-                    raise ConnectionError(f"PM5 USB error ({e.errno}): {str(e)}")
+                self._write_report(csafe_frame)
+            except OSError as e:
+                raise ConnectionError(f"PM5 write error: {e}")
 
-            # Receive response
             response = []
             while not response:
                 try:
-                    transmission = self.erg.read(self.inEndpoint, 64, timeout=2000)
+                    raw = self._read_report(timeout_ms=2000)
+                    # raw[0] is the report ID; CSAFE data starts at raw[1:]
+                    transmission = list(raw)
                     response = csafe_cmd.read(transmission)
-                except USBError as e:
-                    if e.errno in (19, 110, 16):
-                        raise ConnectionError(f"PM5 USB error ({e.errno}): {str(e)}")
-                    elif e.errno == 75:
-                        raise ConnectionError(f"PM5 USB error ({e.errno}): buffer overflow")
-                    else:
-                        raise ConnectionError(f"PM5 USB error ({e.errno}): {str(e)}")
+                except TimeoutError as e:
+                    raise ConnectionError(str(e))
+                except OSError as e:
+                    raise ConnectionError(f"PM5 read error: {e}")
 
             self.__lastsend = datetime.datetime.now()
             return response
+
+    def send_raw(self, message):
+        """Like send() but returns (parsed_response, raw_bytes) tuple."""
+        with self.__send_lock:
+            now = datetime.datetime.now()
+            delta = (now - self.__lastsend).total_seconds()
+            if delta < MIN_FRAME_GAP:
+                time.sleep(MIN_FRAME_GAP - delta)
+
+            csafe_frame = csafe_cmd.write(message)
+            try:
+                self._write_report(csafe_frame)
+            except OSError as e:
+                raise ConnectionError(f"PM5 write error: {e}")
+
+            try:
+                raw = self._read_report(timeout_ms=2000)
+                transmission = list(raw)
+                import warnings
+                with warnings.catch_warnings(record=True):
+                    warnings.simplefilter("always")
+                    response = csafe_cmd.read(transmission)
+            except TimeoutError as e:
+                raise ConnectionError(str(e))
+            except OSError as e:
+                raise ConnectionError(f"PM5 read error: {e}")
+
+            self.__lastsend = datetime.datetime.now()
+            return response, bytes(raw)
