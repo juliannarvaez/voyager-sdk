@@ -312,6 +312,11 @@ class KeypointRecorder:
         """
         Add frame to circular buffer and handle event-based collection.
         
+        Collects: buffer_size pre-drive frames + all drive frames + buffer_size
+        post-drive frames.  Then queues a lightweight reference to the save
+        worker — all data assembly, force data polling, JSON serialization,
+        and file I/O happen on the background save worker thread (cores 0-1).
+        
         Args:
             frame_data: Keypoint data for current frame (None if no detections)
         """
@@ -323,30 +328,26 @@ class KeypointRecorder:
         # Always maintain circular buffer (last N frames)
         self.keypoint_buffer.append(frame_data)
         
-        # Phase-based event collection - only process if phase is relevant
         phase = self.current_phase
+        
         if phase == 2:  # Drive phase
             if not self.event_active:
-                # Event just started - copy buffer to storage (N frames before event)
+                # Start new stroke collection
                 self.event_active = True
                 self.event_keypoints = list(self.keypoint_buffer)
                 self.post_event_count = 0
                 LOG.info(f"Stroke event started - buffered {len(self.event_keypoints)} pre-drive frames")
             else:
-                # Continue collecting during event
+                # Continue collecting during drive
                 self.event_keypoints.append(frame_data)
         
         elif self.event_active:
-            # Any non-drive phase after drive = post-event (dwelling, recovery, or back to idle)
-            # Collect N frames after event ends
-            if self.post_event_count < self.buffer_size:
-                self.event_keypoints.append(frame_data)
-                self.post_event_count += 1
-                if self.post_event_count % 10 == 0:  # Log every 10 frames
-                    LOG.debug(f"Post-event collection: {self.post_event_count}/{self.buffer_size} frames")
-            else:
-                # Event complete - queue for save
-                LOG.info(f"Stroke event complete - saving {len(self.event_keypoints)} total frames")
+            # Drive just ended — collect post-drive frames
+            self.event_keypoints.append(frame_data)
+            self.post_event_count += 1
+            if self.post_event_count >= self.buffer_size:
+                # 30 post-drive frames collected — hand off to save worker
+                LOG.info(f"Stroke complete: {len(self.event_keypoints)} frames, queuing save")
                 self._queue_save()
                 self.event_active = False
                 self.post_event_count = 0
@@ -406,73 +407,94 @@ class KeypointRecorder:
         self.event_keypoints = []
     
     def _queue_save(self, additional_data: Optional[Dict[str, Any]] = None):
-        """Queue event data for async save"""
+        """Queue a lightweight reference for the save worker — near-zero inference impact.
+        
+        Only swaps the list reference and appends to the deque (~microseconds).
+        All heavy work (data assembly, force-data polling, JSON serialization,
+        file I/O) runs on the background save worker thread (cores 0-1).
+        """
         timestamp = int(time.time())
         filename = os.path.join(self.save_dir, f"stroke_{timestamp}.json")
         
-        # Structure data as JSON
-        data = {
-            "timestamp": timestamp,
-            "frame_count": len(self.event_keypoints),
-            "keypoints": [
-                frame.keypoints for frame in self.event_keypoints
-            ],
-            "phases": [frame.phase for frame in self.event_keypoints],
-            "frame_timestamps": [frame.timestamp for frame in self.event_keypoints]  # Add frame timestamps
-        }
+        # Swap the list reference (near-instant)
+        event_snapshot = self.event_keypoints
+        pc = self.phase_controller
         
-        # Add force data if available from phase controller
-        force_data = []
-        if self.phase_controller is not None:
-            force_data = self.phase_controller.get_force_data()
-        # Also check local force curve (set via set_force_curve)
-        if not force_data:
-            force_data = self.get_force_data()
-        
-        if force_data:
-            data['force'] = force_data
-            LOG.info(f"Saving stroke with {len(force_data)} force samples")
-            # Clear force data after capturing it for this stroke
-            if self.phase_controller is not None:
-                self.phase_controller.clear_force_data()
-        else:
-            LOG.warning("No force data available for this stroke")
-        
-        # Merge additional data (e.g., force measurements)
-        if additional_data:
-            data.update(additional_data)
-        
-        # Queue for background save
         with self.save_queue_lock:
-            self.save_queue.append((data, filename))
+            self.save_queue.append((event_snapshot, filename, timestamp, pc, additional_data))
         
-        # Use debug level to avoid I/O overhead
-        LOG.debug(f"Queued event save: {len(self.event_keypoints)} frames -> {filename}")
+        LOG.debug(f"Queued save: {len(event_snapshot)} frames -> {filename}")
     
     def _save_worker(self):
-        """Background worker thread for async saves (optimized for minimal GIL contention)"""
-        import threading
-        
+        """Background save worker — assembles data, waits for force, serializes, writes.
+
+        Runs on cores 0-1 to keep inference cores 2-3 free.  Uses
+        multiprocessing.Event (wait_for_stroke_data) to block until the
+        polling process signals that force data is in shared memory.
+        No polling, no race, no missed data.
+        """
+        try:
+            import os as _os
+            _os.sched_setaffinity(0, {0, 1})
+            LOG.debug("Save worker thread pinned to cores 0-1")
+        except Exception:
+            pass
         while True:
-            # Block until work is available (no busy-wait, releases GIL)
-            time.sleep(0.1)  # Fast response, releases GIL
-            
+            time.sleep(0.05)  # 50ms poll for queue items
+
             with self.save_queue_lock:
                 if not self.save_queue:
                     continue
-                # Process oldest save first
-                data, filename = self.save_queue.popleft()
-            
+                event_snapshot, filename, timestamp, pc, additional_data = self.save_queue.popleft()
+
             try:
-                # Save as plain JSON with optimized settings
-                # separators and ensure_ascii reduce encoding overhead
-                with open(filename, 'w', buffering=65536) as f:  # 64KB buffer for faster writes
-                    json.dump(data, f, separators=(',', ':'), ensure_ascii=False)
+                # Assemble keypoint data
+                data = {
+                    "timestamp": timestamp,
+                    "frame_count": len(event_snapshot),
+                    "keypoints": [f.keypoints for f in event_snapshot],
+                    "phases": [f.phase for f in event_snapshot],
+                    "frame_timestamps": [f.timestamp for f in event_snapshot],
+                }
+
+                # Wait for force data via multiprocessing.Event (set by polling process)
+                if pc is not None:
+                    stroke_data = pc.wait_for_stroke_data(timeout=5.0)
+
+                    force_data = stroke_data.get('force', [])
+                    if force_data:
+                        data['force'] = force_data
+
+                    drag_factor = stroke_data.get('drag_factor')
+                    if drag_factor is not None:
+                        data['drag_factor'] = drag_factor
+
+                    stroke_stats = stroke_data.get('stroke_stats', {})
+                    if stroke_stats:
+                        data['stroke_stats'] = stroke_stats
+
+                    pc.clear_force_data()
+                else:
+                    force_data = self.get_force_data()
+                    if force_data:
+                        data['force'] = force_data
+
+                if additional_data:
+                    data.update(additional_data)
+
+                # Serialize + write (write syscall releases GIL)
+                json_bytes = json.dumps(data, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+                with open(filename, 'wb', buffering=65536) as f:
+                    f.write(json_bytes)
+
                 self.events_saved += 1
-                # Use debug level to avoid I/O overhead
-                LOG.debug(f"Saved event {self.events_saved} to {filename}")
+                force_count = len(data.get('force', []))
+                LOG.info(f"Saved stroke {self.events_saved}: {len(event_snapshot)} frames, "
+                         f"{force_count} force samples -> {filename}")
             except Exception as e:
-                LOG.error(f"Error saving event: {e}")
+                LOG.error(f"Error saving stroke: {e}")
+                import traceback
+                traceback.print_exc()
     
     def get_stats(self) -> Dict[str, Any]:
         """Get recorder statistics"""

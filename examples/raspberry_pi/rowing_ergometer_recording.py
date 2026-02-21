@@ -6,7 +6,8 @@
 Rowing Ergometer Keypoint Recording Script
 
 Records pose keypoints during rowing strokes with phase-based event capture.
-Uses embedded pyrow module from cameraerg repository for Concept2 PM5 integration.
+Uses embedded pyrow module (hidraw-based) for Concept2 PM5 integration.
+    Report ID #2: 120-byte CSAFE payload via kernel HID driver.
 
 Usage:
     # Basic recording (requires Concept2 PM5 ergometer)
@@ -221,7 +222,7 @@ def create_erg_phase_callback():
         # Retry connection up to 3 times for flaky cables
         for attempt in range(3):
             try:
-                ergs = list(pyrow.find())
+                ergs = pyrow.find()
                 if not ergs:
                     if attempt == 2:
                         return False
@@ -229,7 +230,8 @@ def create_erg_phase_callback():
                     continue
                 
                 erg[0] = pyrow.PyErg(ergs[0])
-                LOG.info(f"Connected to Concept2 ergometer: {ergs[0]}")
+                LOG.info(f"Connected to Concept2 ergometer: {ergs[0]}  "
+                         f"(report ID #{pyrow.REPORT_ID}, {pyrow.REPORT_DATA_SIZE}-byte CSAFE payload)")
                 
                 # Give PM5 extra time to stabilize after USB connection
                 time.sleep(2.0)
@@ -372,65 +374,107 @@ def create_erg_phase_callback():
     
     last_logged_phase = [0]
     force_collected = [False]  # Track if force was collected for this stroke
+    draining = [False]         # True while incrementally draining force buffer
+    pending_force = [[]]       # Accumulate force samples across multiple calls
     
     def get_phase():
-        """Get current stroke phase and force data from PM5 (complete curve via multiple polls) with auto-reconnect"""
+        """Get current stroke phase (and drain force data incrementally) from PM5.
+        
+        Uses COMBINED CSAFE frames: STROKESTATE + FORCEPLOTDATA in a single
+        USB round-trip (~50ms).  Phase updates never stall during force drain.
+        During non-drain states, sends STROKESTATE only.
+        """
         # Auto-reconnect if disconnected
         if erg[0] is None:
             if not connect_ergometer():
-                return {'phase': 0, 'force': []}  # Return idle if not connected
+                return {'phase': 0, 'force': []}
         
         try:
-            stroke_result = erg[0].send(['CSAFE_PM_GET_STROKESTATE'])
-            phase = stroke_result.get('CSAFE_PM_GET_STROKESTATE', [0])[0]
-            consecutive_errors[0] = 0  # Reset error counter on success
+            # Build command: always STROKESTATE, add FORCEPLOTDATA if draining
+            if draining[0]:
+                # Combined frame: both commands in ONE USB round-trip
+                combined = erg[0].send(['CSAFE_PM_GET_STROKESTATE',
+                                        'CSAFE_PM_GET_FORCEPLOTDATA', 32])
+                phase = combined.get('CSAFE_PM_GET_STROKESTATE', [0])[0]
+                fp = combined.get('CSAFE_PM_GET_FORCEPLOTDATA', [0])
+                byte_count = fp[0] if fp else 0
+                datapoints = byte_count // 2
+                samples = fp[1:datapoints + 1] if len(fp) > datapoints else []
+            else:
+                resp = erg[0].send(['CSAFE_PM_GET_STROKESTATE'])
+                phase = resp.get('CSAFE_PM_GET_STROKESTATE', [0])[0]
+                samples = []
+            
+            consecutive_errors[0] = 0
             
             if phase != last_logged_phase[0]:
                 phase_names = {0: 'IDLE', 1: 'PREP', 2: 'DRIVE', 3: 'DWELLING', 4: 'RECOVERY'}
                 LOG.info(f"Ergometer phase: {last_logged_phase[0]} -> {phase} ({phase_names.get(phase, 'UNKNOWN')})")
                 
-                # Reset force collection flag on DRIVE start
-                if phase == 2:
+                if phase == 2:  # DRIVE start — reset drain state
                     force_collected[0] = False
+                    draining[0] = False
+                    pending_force[0] = []
                 
                 last_logged_phase[0] = phase
             
-            force_curve = []
+            result = {'phase': phase, 'force': []}
             
-            # Collect force curve at DWELLING/RECOVERY phase (PM5 spec)
-            # Force data accumulated during DRIVE, available in DWELLING (3) or RECOVERY (4)
-            if phase in [3, 4] and not force_collected[0]:
-                force_collected[0] = True
-                
-                # Poll PM5 buffer until empty (PM5 has ~500 samples @ 500Hz for 1-2s stroke)
-                # Each poll returns up to 32 samples (64 bytes / 2 bytes per sample)
-                # Need ~16 polls for full stroke (500 samples / 32 per poll)
-                for attempt in range(50):  # Increased from 20 - allow for long strokes
-                    try:
-                        r = erg[0].send(['CSAFE_PM_GET_FORCEPLOTDATA', 64])
-                        fp = r.get('CSAFE_PM_GET_FORCEPLOTDATA', [0])
-                        byte_count = fp[0] if len(fp) > 0 else 0
-                        datapoints = byte_count // 2
-                        samples = fp[1:(datapoints+1)] if len(fp) > datapoints else []
-                    except Exception as e:
-                        if attempt == 0:
-                            LOG.warning(f"Force data query failed: {e}")
-                        break
-                    
-                    if not samples:
-                        if attempt > 0:
-                            # Normal completion - buffer exhausted
-                            break
-                        else:
-                            LOG.warning("No force data available for this stroke (ensure SETPROGRAM_CMD was sent)")
-                            break
-                    
-                    force_curve.extend(samples)
-                
-                if force_curve:
-                    LOG.info(f"Force curve collected: {len(force_curve)} samples (drive duration ~{len(force_curve)/500:.2f}s @ 500Hz)")
+            # Start drain on DWELLING/RECOVERY after drive.
+            # Skip drain-result processing on THIS call because we sent
+            # STROKESTATE-only (draining was False at the top of this call).
+            # The next poll iteration will send the combined command.
+            just_started_drain = False
+            if phase in [3, 4] and not force_collected[0] and not draining[0]:
+                draining[0] = True
+                pending_force[0] = []
+                just_started_drain = True
             
-            return {'phase': phase, 'force': force_curve}
+            # Process force samples from combined frame
+            if draining[0] and not just_started_drain:
+                if samples:
+                    pending_force[0].extend(samples)
+                else:
+                    # Empty response — buffer exhausted, drain complete
+                    draining[0] = False
+                    force_collected[0] = True
+                    
+                    if pending_force[0]:
+                        result['force'] = pending_force[0]
+                        LOG.info(f"Force curve collected: {len(pending_force[0])} samples "
+                                 f"(drive duration ~{len(pending_force[0])/500:.2f}s @ 500Hz)")
+                        
+                        # Fetch drag factor + stroke stats (combined frame, 1 USB call)
+                        try:
+                            meta = erg[0].send(['CSAFE_PM_GET_DRAGFACTOR',
+                                                'CSAFE_PM_GET_STROKESTATS', 0])
+                            drag = meta.get('CSAFE_PM_GET_DRAGFACTOR', [None])
+                            if drag and drag[0] is not None:
+                                result['drag_factor'] = drag[0]
+                                LOG.info(f"Drag factor: {drag[0]}")
+                            ss = meta.get('CSAFE_PM_GET_STROKESTATS', [])
+                            if len(ss) >= 9:
+                                result['stroke_stats'] = {
+                                    'stroke_distance': ss[0],
+                                    'drive_time': ss[1],
+                                    'recovery_time': ss[2],
+                                    'stroke_length': ss[3],
+                                    'stroke_count': ss[4],
+                                    'peak_force': ss[5],
+                                    'impulse_force': ss[6],
+                                    'avg_force': ss[7],
+                                    'work_per_stroke': ss[8],
+                                }
+                                LOG.info(f"Stroke stats: peak={ss[5]}, avg={ss[7]}, "
+                                         f"drive_time={ss[1]}, count={ss[4]}")
+                        except Exception as e:
+                            LOG.debug(f"Drag/stats query failed: {e}")
+                    else:
+                        LOG.warning("No force data available for this stroke")
+                    
+                    pending_force[0] = []
+            
+            return result
         except ConnectionError as e:
             # Connection lost - trigger reconnect
             consecutive_errors[0] += 1

@@ -91,8 +91,10 @@ def write(arguments):
 
         #max message length
         cmdid = cmdprop[0] | (wrapper << 8)
-        #double return to account for stuffing
-        maxresponse += abs(sum(csafe_dic.resp[cmdid][1])) * 2 + 1
+        #account for response data + cmd echo byte + bytecount byte
+        #add small margin for possible byte stuffing (unlikely for most data)
+        resp_bytes = abs(sum(csafe_dic.resp[cmdid][1]))
+        maxresponse += resp_bytes + 3  # data + cmd_echo + bytecount + margin
 
         #add completed command to final message
         message.extend(command)
@@ -129,28 +131,14 @@ def write(arguments):
     message.insert(0, csafe_dic.Standard_Frame_Start_Flag)
     message.append(csafe_dic.Stop_Frame_Flag)
 
-    #check for frame size (96 bytes)
-    if len(message) > 96:
-        warn("Message is too long: " + len(message))
+    #check for frame size — report ID #2 allows up to 120 bytes of
+    #CSAFE payload.  The frame itself (with start/stop/checksum) should
+    #fit comfortably.
+    if len(message) > 120:
+        warn("Message is too long: " + str(len(message)))
 
-    #report IDs
-    maxmessage = max(len(message) + 1, maxresponse)
-
-    if maxmessage <= 21:
-        message.insert(0, 0x01)
-        message += [0] * (21 - len(message))
-    elif maxmessage <= 63:
-        message.insert(0, 0x04)
-        message += [0] * (63 - len(message))
-    elif (len(message) + 1) <= 121:
-        message.insert(0, 0x02)
-        message += [0] * (121 - len(message))
-        if maxresponse > 121:
-            warn("Response may be too long to recieve.  Max possible length " + str(maxresponse))
-    else:
-        warn("Message too long.  Message length " + str(len(message)))
-        message = []
-
+    #Return the raw CSAFE frame — the transport layer (pyrow.py) handles
+    #report ID selection and zero-padding for the HID report.
     return message
 
 
@@ -208,10 +196,16 @@ def read(transmission):
         j += 1
 
     if not stopfound:
-        warn("No Stop Flag found.")
-        return []
+        if len(message) < 1:
+            warn("No Stop Flag found and no data.")
+            return []
+        warn("No Stop Flag found — frame may be truncated.")
 
     message = __check_message(message)
+
+    if not message:
+        return []
+
     status = message.pop(0)
 
     #prime variables
@@ -224,14 +218,22 @@ def read(transmission):
     while k < len(message):
         result = []
 
+        #bounds check – stop if we've run past available data (truncated frame)
+        if k >= len(message):
+            break
+
         #get command name
         msgcmd = message[k]
         if k <= wrapend:
             msgcmd = wrapper | msgcmd #check if still in wrapper
+        if msgcmd not in csafe_dic.resp:
+            break  # unknown command byte – likely hit padding/truncation
         msgprop = csafe_dic.resp[msgcmd]
         k = k + 1
 
         #get data byte count
+        if k >= len(message):
+            break
         bytecount = message[k]
         k = k + 1
 
@@ -240,19 +242,40 @@ def read(transmission):
             wrapper = message[k - 2] << 8
             wrapend = k  + bytecount - 1
             if bytecount: #If wrapper length != 0
+                if k >= len(message):
+                    break
                 msgcmd = wrapper | message[k]
+                if msgcmd not in csafe_dic.resp:
+                    break
                 msgprop = csafe_dic.resp[msgcmd]
                 k = k + 1
+                if k >= len(message):
+                    break
                 bytecount = message[k]
                 k = k + 1
 
+        #special case for force plot and heartbeat data: variable-length response
+        #The inner bytecount is always 33 (PM5 fixed template), but the FIRST
+        #data byte (bytes_read) tells us how many of the following bytes are
+        #real data.  The rest may be uninitialized PM5 memory (garbage).
+        #Peek at bytes_read to build the correct response definition.
+        if msgprop[0] in ('CSAFE_PM_GET_FORCEPLOTDATA', 'CSAFE_PM_GET_HEARTBEATDATA'):
+            if bytecount > 0 and k < len(message):
+                actual_data_bytes = message[k]  # peek at bytes_read
+                num_samples = actual_data_bytes // 2
+                msgprop = [msgprop[0], [1] + [2] * num_samples]  # copy, don't mutate global
+            elif bytecount == 0:
+                msgprop = [msgprop[0], [0,]]
+            else:
+                msgprop = [msgprop[0], [1]]  # just bytes_read, no samples available
+
         #special case for capability code, response lengths differ based off capability code
         if msgprop[0] == 'CSAFE_GETCAPS_CMD':
-            msgprop[1] = [1,] * bytecount
+            msgprop = [msgprop[0], [1,] * bytecount]  # copy, don't mutate global
 
         #special case for get id, response length is variable
         if msgprop[0] == 'CSAFE_GETID_CMD':
-            msgprop[1] = [(-bytecount),]
+            msgprop = [msgprop[0], [(-bytecount),]]  # copy, don't mutate global
 
         #checking that the recieved data byte is the expected length, sanity check
         if abs(sum(msgprop[1])) != 0 and bytecount != abs(sum(msgprop[1])):
@@ -260,10 +283,13 @@ def read(transmission):
 
         #extract values
         for numbytes in msgprop[1]:
-            raw_bytes = message[k:k + abs(numbytes)]
+            n = abs(numbytes)
+            raw_bytes = message[k:k + n]
+            if len(raw_bytes) < n:
+                raw_bytes = raw_bytes + [0] * (n - len(raw_bytes))
             value = (__bytes2int(raw_bytes) if numbytes >= 0 else __bytes2ascii(raw_bytes))
             result.append(value)
-            k = k + abs(numbytes)
+            k = k + n
 
         response[msgprop[0]] = result
 
