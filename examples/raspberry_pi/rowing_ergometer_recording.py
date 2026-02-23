@@ -551,7 +551,7 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
     stats_interval_frames = args.stats_interval
     
     LOG.info("Starting inference loop with keypoint recording...")
-    LOG.info(f"Recorder: buffer_size={recorder.buffer_size}, save_dir={recorder.save_dir}")
+    LOG.info(f"Recorder: buffer_size={recorder.buffer_size}, post_buffer_size={recorder.post_buffer_size}, save_dir={recorder.save_dir}")
     LOG.info(f"Phase control: {controller.get_phase_name()}")
     if args.headless:
         LOG.info("Headless mode: display disabled for minimal latency")
@@ -765,7 +765,13 @@ def main():
         '--keypoint-buffer-size',
         type=int,
         default=30,
-        help="Number of frames to buffer before events (default: 30 frames @ 90 FPS = ~330ms)",
+        help="Number of frames to buffer before drive (default: 30 frames @ 90 FPS = ~330ms)",
+    )
+    parser.add_argument(
+        '--post-drive-frames',
+        type=int,
+        default=60,
+        help="Number of frames to collect after drive ends (default: 60 frames @ 90 FPS = ~670ms)",
     )
     parser.add_argument(
         '--no-progress',
@@ -820,6 +826,7 @@ def main():
     # Initialize keypoint recorder with fixed save directory
     recorder = KeypointRecorder(
         buffer_size=args.keypoint_buffer_size,
+        post_buffer_size=args.post_drive_frames,
         save_dir="/tmp/stroke_data"
     )
     
