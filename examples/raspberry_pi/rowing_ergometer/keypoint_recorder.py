@@ -75,15 +75,17 @@ class KeypointRecorder:
         "right_ankle": 16,
     }
     
-    def __init__(self, buffer_size: int = 30, save_dir: str = "/tmp/stroke_data"):
+    def __init__(self, buffer_size: int = 30, post_buffer_size: int = 60, save_dir: str = "/tmp/stroke_data"):
         """
         Initialize keypoint recorder.
         
         Args:
             buffer_size: Number of frames to buffer before events (default 30 @ ~90 FPS = ~330ms)
+            post_buffer_size: Number of frames to collect after drive ends (default 60 @ ~90 FPS = ~670ms)
             save_dir: Directory for saved stroke data files
         """
         self.buffer_size = buffer_size
+        self.post_buffer_size = post_buffer_size
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
         
@@ -121,7 +123,7 @@ class KeypointRecorder:
         self.frame_count = 0
         self.events_saved = 0
         
-        LOG.info(f"KeypointRecorder initialized: buffer_size={buffer_size}, save_dir={save_dir}")
+        LOG.info(f"KeypointRecorder initialized: buffer_size={buffer_size}, post_buffer_size={post_buffer_size}, save_dir={save_dir}")
     
     def extract_keypoints_from_meta(self, meta, width: int, height: int, frame_number: int, timestamp: float) -> Optional[FrameKeypointData]:
         """
@@ -312,7 +314,7 @@ class KeypointRecorder:
         """
         Add frame to circular buffer and handle event-based collection.
         
-        Collects: buffer_size pre-drive frames + all drive frames + buffer_size
+        Collects: buffer_size pre-drive frames + all drive frames + post_buffer_size
         post-drive frames.  Then queues a lightweight reference to the save
         worker — all data assembly, force data polling, JSON serialization,
         and file I/O happen on the background save worker thread (cores 0-1).
@@ -345,8 +347,8 @@ class KeypointRecorder:
             # Drive just ended — collect post-drive frames
             self.event_keypoints.append(frame_data)
             self.post_event_count += 1
-            if self.post_event_count >= self.buffer_size:
-                # 30 post-drive frames collected — hand off to save worker
+            if self.post_event_count >= self.post_buffer_size:
+                # post_buffer_size post-drive frames collected — hand off to save worker
                 LOG.info(f"Stroke complete: {len(self.event_keypoints)} frames, queuing save")
                 self._queue_save()
                 self.event_active = False
@@ -502,6 +504,7 @@ class KeypointRecorder:
             "frames_processed": self.frame_count,
             "events_saved": self.events_saved,
             "buffer_size": self.buffer_size,
+            "post_buffer_size": self.post_buffer_size,
             "current_phase": self.current_phase,
             "event_active": self.event_active,
             "queue_depth": len(self.save_queue)

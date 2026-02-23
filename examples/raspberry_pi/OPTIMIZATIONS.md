@@ -136,7 +136,7 @@ for item in meta:
 **Minimal Logging in Hot Path**
 ```python
 # Use debug level for non-critical logs (can be disabled)
-LOG.debug(f"Post-event collection: {self.post_event_count}/{self.buffer_size}")
+LOG.debug(f"Post-event collection: {self.post_event_count}/{self.post_buffer_size}")
 
 # Only log important state changes
 LOG.info(f"Phase transition: {old_phase} -> {new_phase}")

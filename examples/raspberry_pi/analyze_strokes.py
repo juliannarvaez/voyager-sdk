@@ -461,8 +461,16 @@ def visualize_keypoints(filepath: str, frame_indices: List[int] = None):
     return fig
 
 
-def parse_stroke_file(filepath: str):
-    """Parse stroke file and extract angles and positions."""
+def parse_stroke_file(filepath: str, handle_offset_m: float = 0.0):
+    """Parse stroke file and extract angles and positions.
+    
+    Args:
+        filepath: Path to stroke JSON file
+        handle_offset_m: Offset from wrist to handle along forearm direction (metres).
+                        When > 0, a synthetic 'handle' position is computed by projecting
+                        from the wrist along the elbow→wrist direction.
+                        Velocity and acceleration are identical to the wrist.
+    """
     data = load_stroke_file(filepath)
     
     # Handle both old Python format and new C++ format
@@ -747,7 +755,7 @@ def parse_stroke_file(filepath: str):
             frame_intervals.insert(0, frame_intervals[0])
             instantaneous_fps.insert(0, instantaneous_fps[0])
     
-    return {
+    result = {
         # Position data
         'shoulder_x': np.array(shoulder_x),
         'shoulder_y': np.array(shoulder_y),
@@ -797,11 +805,53 @@ def parse_stroke_file(filepath: str):
         'frame_intervals': np.array(frame_intervals),
         'instantaneous_fps': np.array(instantaneous_fps),
         'detected_fps': detected_fps,
-        'force_curve': data.get('force', [])
+        'force_curve': data.get('force', []),
+        # Handle offset data (if requested)
+        'handle_offset_m': handle_offset_m,
     }
 
+    # --- Synthetic 'handle' position from wrist + forearm offset ---
+    if handle_offset_m > 0:
+        pixels_per_meter = 100.0
+        rw_x = result['right_wrist_x']
+        rw_y = result['right_wrist_y']
+        re_x = result['right_elbow_x']
+        re_y = result['right_elbow_y']
 
-def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, axes=None):
+        if len(rw_x) == len(re_x) and len(rw_x) > 0:
+            # Purely horizontal offset: wrist bends to keep handle level
+            # Direction is elbow→wrist horizontal sign
+            dx = rw_x - re_x
+            sign_x = np.sign(dx)
+            sign_x[sign_x == 0] = 1.0  # default rightward if aligned
+
+            offset_px = handle_offset_m * pixels_per_meter
+            result['handle_x'] = rw_x + offset_px * sign_x
+            result['handle_y'] = rw_y  # same Y as wrist (horizontal)
+            # Handle velocity = extra-smoothed wrist velocity with lag (hand stabilises the handle)
+            handle_smooth_window = 21  # ~350ms at 60fps
+            handle_delay_frames = 3    # ~50ms lag at 60fps
+            handle_vx = moving_average(result['right_wrist_vx'].copy(), handle_smooth_window)
+            handle_vy = moving_average(result['right_wrist_vy'].copy(), handle_smooth_window)
+            # Shift forward (delay) and backfill with zero
+            if handle_delay_frames > 0:
+                handle_vx = np.concatenate([np.zeros(handle_delay_frames), handle_vx[:-handle_delay_frames]])
+                handle_vy = np.concatenate([np.zeros(handle_delay_frames), handle_vy[:-handle_delay_frames]])
+            result['handle_vx'] = handle_vx
+            result['handle_vy'] = handle_vy
+            result['handle_speed'] = np.sqrt(handle_vx**2 + handle_vy**2)
+        else:
+            # Fallback: no elbow data, place handle at wrist
+            result['handle_x'] = rw_x.copy()
+            result['handle_y'] = rw_y.copy()
+            result['handle_vx'] = result['right_wrist_vx'].copy()
+            result['handle_vy'] = result['right_wrist_vy'].copy()
+            result['handle_speed'] = result['right_wrist_speed'].copy()
+
+    return result
+
+
+def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, axes=None, handle_offset_m: float = 0.0, vx_threshold: float = 0.1):
     """Show interactive plot for a single stroke.
     
     Args:
@@ -810,12 +860,14 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
         total_files: Total number of stroke files
         fig: Optional existing figure to update (for smooth transitions)
         axes: Optional existing axes to update (for smooth transitions)
+        handle_offset_m: Offset from wrist to handle along forearm (metres)
+        vx_threshold: Wrist velocity threshold (m/s) for force curve fitting region
     """
     if not HAS_MATPLOTLIB:
         print("ERROR: matplotlib not available. Install with: pip3 install matplotlib")
         return None
     
-    data = parse_stroke_file(filepath)
+    data = parse_stroke_file(filepath, handle_offset_m=handle_offset_m)
     
     # Position data
     shoulder_x = data['shoulder_x']
@@ -834,6 +886,14 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     left_elbow_y = data['left_elbow_y']
     right_elbow_x = data['right_elbow_x']
     right_elbow_y = data['right_elbow_y']
+    # Handle data (if offset was requested)
+    has_handle = 'handle_x' in data
+    if has_handle:
+        handle_x = data['handle_x']
+        handle_y = data['handle_y']
+        handle_vx = data['handle_vx']
+        handle_vy = data['handle_vy']
+        handle_speed = data['handle_speed']
     # Velocity data
     shoulder_vx = data['shoulder_vx']
     shoulder_vy = data['shoulder_vy']
@@ -872,6 +932,33 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     left_elbow_y_smooth = left_elbow_y
     right_elbow_x_smooth = right_elbow_x
     right_elbow_y_smooth = right_elbow_y
+    if has_handle:
+        handle_x_smooth = handle_x
+        handle_y_smooth = handle_y
+        handle_speed_smooth = handle_speed
+
+    # --- Centre of mass position (Dumas et al. 2007 anthropometric model, males) ---
+    # Segments: (proximal_x, proximal_y, distal_x, distal_y, mass_frac, com_position)
+    _com_segs = [
+        (shoulder_x_smooth, shoulder_y_smooth, None, None,                   0.067, 0.0),   # head+neck
+        (shoulder_x_smooth, shoulder_y_smooth, hip_x_smooth, hip_y_smooth,   0.333, 0.42),  # torso
+        (hip_x_smooth, hip_y_smooth, None, None,                             0.142, 0.0),   # pelvis
+        (shoulder_x_smooth, shoulder_y_smooth, right_wrist_x_smooth, right_wrist_y_smooth, 0.094, 0.50),  # arms
+        (hip_x_smooth, hip_y_smooth, knee_x_smooth, knee_y_smooth,           0.246, 0.429), # thighs
+        (knee_x_smooth, knee_y_smooth, ankle_x_smooth, ankle_y_smooth,       0.096, 0.41),  # shanks
+        (ankle_x_smooth, ankle_y_smooth, None, None,                         0.028, 0.0),   # feet
+    ]
+    _com_total_w = sum(s[4] for s in _com_segs)
+    com_x_smooth = np.zeros(len(shoulder_x_smooth))
+    com_y_smooth = np.zeros(len(shoulder_y_smooth))
+    for (px, py, dx, dy, mf, cf) in _com_segs:
+        w = mf / _com_total_w
+        if dx is None:
+            com_x_smooth += w * px
+            com_y_smooth += w * py
+        else:
+            com_x_smooth += w * ((1.0 - cf) * px + cf * dx)
+            com_y_smooth += w * ((1.0 - cf) * py + cf * dy)
     
     # Compute elbow speeds from velocities
     right_elbow_vx = data['right_elbow_vx']
@@ -936,16 +1023,20 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     
     # Plot 1: Animated Skeleton
     # Set up the skeleton plot
-    x_min = min(min(shoulder_x_smooth), min(hip_x_smooth), min(knee_x_smooth), min(ankle_x_smooth), min(right_wrist_x_smooth), min(right_elbow_x_smooth))
-    x_max = max(max(shoulder_x_smooth), max(hip_x_smooth), max(knee_x_smooth), max(ankle_x_smooth), max(right_wrist_x_smooth), max(right_elbow_x_smooth))
-    y_min = min(min(shoulder_y_smooth), min(hip_y_smooth), min(knee_y_smooth), min(ankle_y_smooth), min(right_wrist_y_smooth), min(right_elbow_y_smooth))
-    y_max = max(max(shoulder_y_smooth), max(hip_y_smooth), max(knee_y_smooth), max(ankle_y_smooth), max(right_wrist_y_smooth), max(right_elbow_y_smooth))
+    all_x = [shoulder_x_smooth, hip_x_smooth, knee_x_smooth, ankle_x_smooth, right_wrist_x_smooth, right_elbow_x_smooth, com_x_smooth]
+    all_y = [shoulder_y_smooth, hip_y_smooth, knee_y_smooth, ankle_y_smooth, right_wrist_y_smooth, right_elbow_y_smooth, com_y_smooth]
+    if has_handle:
+        all_x.append(handle_x_smooth)
+        all_y.append(handle_y_smooth)
+    x_min = min(min(a) for a in all_x)
+    x_max = max(max(a) for a in all_x)
+    y_min = min(min(a) for a in all_y)
+    y_max = max(max(a) for a in all_y)
     
     ax1.set_xlim(x_min - 20, x_max + 20)
     ax1.set_ylim(y_max + 20, y_min - 20)  # Inverted Y
     ax1.set_xlabel('X Position (px)', fontsize=10)
     ax1.set_ylabel('Y Position (px)', fontsize=10)
-    ax1.set_title('Skeleton Animation (Frame: 0)', fontsize=12)
     ax1.grid(True, alpha=0.3)
     ax1.set_aspect('equal')
     
@@ -966,19 +1057,54 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
     # Forearm: elbow -> wrist
     line5, = ax1.plot([], [], 'darkred', linewidth=3, label='Forearm')
     skeleton_lines.append(line5)
+    # Hand/Handle: wrist -> handle (if offset active)
+    if has_handle:
+        line6, = ax1.plot([], [], 'magenta', linewidth=3, linestyle='--', label='Handle')
+        skeleton_lines.append(line6)
     
     # Draw joints as scatter points
     joints_scatter = ax1.scatter([], [], s=100, c='red', zorder=5)
-    
+    # Separate handle marker (diamond, magenta) so it stands out
+    handle_scatter = ax1.scatter([], [], s=120, c='magenta', marker='D', zorder=6) if has_handle else None
+    # CoM marker (large star, black)
+    com_scatter = ax1.scatter([], [], s=180, c='black', marker='*', zorder=7, label='CoM')
+
     # Trail showing recent positions
     trail_length = 10
     trail_lines = []
-    for _ in range(6):  # One trail per joint (shoulder, hip, knee, ankle, elbow, wrist)
-        trail, = ax1.plot([], [], 'gray', alpha=0.3, linewidth=1)
+    n_trails = 8 if has_handle else 7  # shoulder, hip, knee, ankle, elbow, wrist, com [, handle]
+    for ti in range(n_trails):
+        if ti == n_trails - 1 and has_handle:
+            color = 'magenta'
+        elif ti == (n_trails - 2 if has_handle else n_trails - 1):
+            color = 'black'  # CoM trail
+        else:
+            color = 'gray'
+        trail, = ax1.plot([], [], color, alpha=0.3, linewidth=1)
         trail_lines.append(trail)
     
     ax1.legend(loc='upper left', fontsize=8)
     
+    # Collect all animated artists for blit
+    all_artists = skeleton_lines + [joints_scatter, com_scatter] + trail_lines
+    if handle_scatter is not None:
+        all_artists.append(handle_scatter)
+    # Title text artist (for blit-friendly title updates)
+    title_text = ax1.set_title('Skeleton Animation (Frame: 0)', fontsize=12)
+    all_artists.append(title_text)
+
+    def init_skeleton():
+        """Initialize all artists for blit."""
+        for line in skeleton_lines:
+            line.set_data([], [])
+        for trail in trail_lines:
+            trail.set_data([], [])
+        joints_scatter.set_offsets(np.empty((0, 2)))
+        if handle_scatter is not None:
+            handle_scatter.set_offsets(np.empty((0, 2)))
+        com_scatter.set_offsets(np.empty((0, 2)))
+        return all_artists
+
     # Animation function
     def update_skeleton(frame_idx):
         if frame_idx >= len(shoulder_x_smooth):
@@ -995,6 +1121,9 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
                                    [shoulder_y_smooth[frame_idx], right_elbow_y_smooth[frame_idx]])
         skeleton_lines[4].set_data([right_elbow_x_smooth[frame_idx], right_wrist_x_smooth[frame_idx]], 
                                    [right_elbow_y_smooth[frame_idx], right_wrist_y_smooth[frame_idx]])
+        if has_handle:
+            skeleton_lines[5].set_data([right_wrist_x_smooth[frame_idx], handle_x_smooth[frame_idx]],
+                                       [right_wrist_y_smooth[frame_idx], handle_y_smooth[frame_idx]])
         
         # Update joint positions
         joint_x = [shoulder_x_smooth[frame_idx], hip_x_smooth[frame_idx], knee_x_smooth[frame_idx], 
@@ -1002,7 +1131,12 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
         joint_y = [shoulder_y_smooth[frame_idx], hip_y_smooth[frame_idx], knee_y_smooth[frame_idx], 
                    ankle_y_smooth[frame_idx], right_elbow_y_smooth[frame_idx], right_wrist_y_smooth[frame_idx]]
         joints_scatter.set_offsets(np.c_[joint_x, joint_y])
-        
+        if has_handle and handle_scatter is not None:
+            handle_scatter.set_offsets(np.c_[[handle_x_smooth[frame_idx]], [handle_y_smooth[frame_idx]]])
+
+        # Update CoM position
+        com_scatter.set_offsets(np.c_[[com_x_smooth[frame_idx]], [com_y_smooth[frame_idx]]])
+
         # Update trails
         start_idx = max(0, frame_idx - trail_length)
         trail_lines[0].set_data(shoulder_x_smooth[start_idx:frame_idx+1], shoulder_y_smooth[start_idx:frame_idx+1])
@@ -1011,15 +1145,19 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
         trail_lines[3].set_data(ankle_x_smooth[start_idx:frame_idx+1], ankle_y_smooth[start_idx:frame_idx+1])
         trail_lines[4].set_data(right_elbow_x_smooth[start_idx:frame_idx+1], right_elbow_y_smooth[start_idx:frame_idx+1])
         trail_lines[5].set_data(right_wrist_x_smooth[start_idx:frame_idx+1], right_wrist_y_smooth[start_idx:frame_idx+1])
+        trail_lines[6].set_data(com_x_smooth[start_idx:frame_idx+1], com_y_smooth[start_idx:frame_idx+1])
+        if has_handle:
+            trail_lines[7].set_data(handle_x_smooth[start_idx:frame_idx+1], handle_y_smooth[start_idx:frame_idx+1])
         
         # Update title with current frame and phase
         phase_name = phase_colors.get(phases[frame_idx], ('white', f'Phase{phases[frame_idx]}'))[1]
-        ax1.set_title(f'Skeleton Animation (Frame: {frame_idx}/{len(frames)-1}, Phase: {phase_name})', fontsize=12)
+        title_text.set_text(f'Skeleton Animation (Frame: {frame_idx}/{len(frames)-1}, Phase: {phase_name})')
         
-        return skeleton_lines + [joints_scatter] + trail_lines
+        return all_artists
     
-    # Create animation
-    anim = FuncAnimation(fig, update_skeleton, frames=len(frames), interval=33, blit=True, repeat=True)
+    # Create animation with blit=True for performance (init_func ensures all artists are registered)
+    anim = FuncAnimation(fig, update_skeleton, init_func=init_skeleton,
+                         frames=len(frames), interval=33, blit=True, repeat=True)
     
     # Store animation reference to prevent garbage collection
     if not hasattr(fig, '_animations'):
@@ -1038,15 +1176,18 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
                 current_phase = phase
                 phase_start = i
     
-    # Plot 2: Joint Speeds (magnitude of velocity = sqrt(vx^2 + vy^2))
-    ax2.plot(frames, shoulder_speed_smooth, 'purple', label='Shoulder', linewidth=2)
-    ax2.plot(frames, hip_speed_smooth, 'blue', label='Hip', linewidth=2)
-    ax2.plot(frames, knee_speed_smooth, 'green', label='Knee', linewidth=2)
-    ax2.plot(frames, ankle_speed_smooth, 'orange', label='Ankle', linewidth=2)
-    ax2.plot(frames, right_wrist_speed_smooth, 'red', label='Right Wrist', linewidth=2)
-    ax2.set_ylabel('Speed (px/s)', fontsize=10)
+    # Plot 2: Horizontal Velocity (vx, right = positive, left = negative)
+    ax2.plot(frames, -shoulder_vx_smooth, 'purple', label='Shoulder', linewidth=2)
+    ax2.plot(frames, -hip_vx_smooth, 'blue', label='Hip', linewidth=2)
+    ax2.plot(frames, -knee_vx_smooth, 'green', label='Knee', linewidth=2)
+    ax2.plot(frames, -ankle_vx_smooth, 'orange', label='Ankle', linewidth=2)
+    ax2.plot(frames, -right_wrist_vx, 'red', label='Right Wrist', linewidth=2)
+    if has_handle:
+        ax2.plot(frames, -handle_vx, 'magenta', label='Handle', linewidth=2, linestyle='--')
+    ax2.axhline(y=0, color='k', linestyle='--', alpha=0.3, linewidth=1)
+    ax2.set_ylabel('Horizontal Velocity (px/s)  [← −, → +]', fontsize=10)
     ax2.set_xlabel('Frame', fontsize=10)
-    ax2.set_title('Joint Speed (√(vx² + vy²))', fontsize=12)
+    ax2.set_title('Horizontal Velocity (vx)', fontsize=12)
     ax2.legend(loc='best', fontsize=8)
     ax2.grid(True, alpha=0.3)
 
@@ -1221,6 +1362,8 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
         knee_accel = compute_acceleration(knee_speed_smooth, timestamps)
         ankle_accel = compute_acceleration(ankle_speed_smooth, timestamps)
         wrist_accel = compute_acceleration(right_wrist_speed_smooth, timestamps)
+        if has_handle:
+            handle_accel = compute_acceleration(handle_speed_smooth, timestamps)
         
         # === ACCELERATION ANALYSIS LOGGING ===
         print(f"\n{'='*60}")
@@ -1236,6 +1379,8 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
             ("Ankle", ankle_accel),
             ("Right Wrist", wrist_accel)
         ]
+        if has_handle:
+            joint_data.append(("Handle", handle_accel))
         
         print(f"\nPer-Joint Acceleration Statistics (px/s²):")
         for joint_name, accel in joint_data:
@@ -1266,6 +1411,9 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
             elif joint_name == "Ankle":
                 pos_x, pos_y = ankle_x_smooth, ankle_y_smooth
                 vel = ankle_speed_smooth
+            elif joint_name == "Handle" and has_handle:
+                pos_x, pos_y = handle_x_smooth, handle_y_smooth
+                vel = handle_speed_smooth
             else:  # Right Wrist
                 pos_x, pos_y = right_wrist_x_smooth, right_wrist_y_smooth
                 vel = right_wrist_speed_smooth
@@ -1291,6 +1439,8 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
         ax3.plot(frames, knee_accel, 'green', linewidth=2, label='Knee', alpha=0.8)
         ax3.plot(frames, ankle_accel, 'orange', linewidth=2, label='Ankle', alpha=0.8)
         ax3.plot(frames, wrist_accel, 'red', linewidth=2, label='Right Wrist', alpha=0.8)
+        if has_handle:
+            ax3.plot(frames, handle_accel, 'magenta', linewidth=2, label='Handle', alpha=0.8, linestyle='--')
         
         # Add zero reference line
         ax3.axhline(y=0, color='black', linestyle='--', linewidth=1, alpha=0.3)
@@ -1305,28 +1455,33 @@ def show_plot(filepath: str, current_file_idx: int, total_files: int, fig=None, 
                 ha='center', va='center', transform=ax3.transAxes, fontsize=10)
         ax3.set_title('Acceleration (Error)', fontsize=12)
     
-    # Plot 4: Force Curve (only during drive phase)
+    # Plot 4: Force Curve (fitted to region where wrist vx > threshold)
     force_curve = data.get('force_curve', [])  # parse_stroke_file returns 'force_curve'
     if force_curve:
-        # Find drive phase frames
-        drive_frames = [i for i, p in enumerate(phases) if p == 2]
-        if drive_frames:
-            # Map force samples to drive phase frames
-            drive_start = drive_frames[0]
-            drive_end = drive_frames[-1]
+        # Find frames where wrist moves leftward above threshold
+        # raw vx is in px/s; convert threshold from m/s to px/s (100 px/m)
+        vx_threshold_pxs = vx_threshold * 100.0
+        positive_vx_frames = [i for i in range(len(right_wrist_vx)) if -right_wrist_vx[i] > vx_threshold_pxs]
+        if not positive_vx_frames:
+            # Fall back to drive phase
+            positive_vx_frames = [i for i, p in enumerate(phases) if p == 2]
+        if positive_vx_frames:
+            # Map force samples to positive-velocity region
+            drive_start = positive_vx_frames[0]
+            drive_end = positive_vx_frames[-1]
             
-            # Interpolate force curve to match drive frames
+            # Interpolate force curve to match positive-velocity frames
             force_x = np.linspace(drive_start, drive_end, len(force_curve))
             
             ax4.plot(force_x, force_curve, 'red', label='Force Curve', linewidth=2.5)
             ax4.fill_between(force_x, 0, force_curve, alpha=0.3, color='red')
             ax4.set_ylabel('Force (PM5 units)', fontsize=10)
             ax4.set_xlabel('Frame', fontsize=10)
-            ax4.set_title('Force Curve (Drive Phase)', fontsize=12)
+            ax4.set_title(f'Force Curve (vx > {vx_threshold:.2f} m/s)', fontsize=12)
             ax4.legend(loc='best', fontsize=8)
             ax4.grid(True, alpha=0.3)
         else:
-            ax4.text(0.5, 0.5, 'No drive phase detected', ha='center', va='center', transform=ax4.transAxes)
+            ax4.text(0.5, 0.5, f'No frames with vx > {vx_threshold:.2f} m/s', ha='center', va='center', transform=ax4.transAxes)
             ax4.set_title('Force Curve (No Data)', fontsize=12)
     else:
         ax4.text(0.5, 0.5, 'No force data available', ha='center', va='center', transform=ax4.transAxes)
@@ -1515,7 +1670,9 @@ def on_key(event, files: List[str], current_idx: list, fig_state: dict):
     if event.key == 'right' and current_idx[0] < len(files) - 1:
         current_idx[0] += 1
         fig, axes = show_plot(files[current_idx[0]], current_idx[0], len(files), 
-                             fig_state.get('fig'), fig_state.get('axes'))
+                             fig_state.get('fig'), fig_state.get('axes'),
+                             handle_offset_m=fig_state.get('handle_offset_m', 0.0),
+                             vx_threshold=fig_state.get('vx_threshold', 0.1))
         if fig:
             fig_state['fig'] = fig
             fig_state['axes'] = axes
@@ -1524,7 +1681,9 @@ def on_key(event, files: List[str], current_idx: list, fig_state: dict):
     elif event.key == 'left' and current_idx[0] > 0:
         current_idx[0] -= 1
         fig, axes = show_plot(files[current_idx[0]], current_idx[0], len(files),
-                             fig_state.get('fig'), fig_state.get('axes'))
+                             fig_state.get('fig'), fig_state.get('axes'),
+                             handle_offset_m=fig_state.get('handle_offset_m', 0.0),
+                             vx_threshold=fig_state.get('vx_threshold', 0.1))
         if fig:
             fig_state['fig'] = fig
             fig_state['axes'] = axes
@@ -1851,6 +2010,23 @@ def main():
         action='store_true',
         help='Show keypoint skeleton visualization instead of angles/positions'
     )
+    parser.add_argument(
+        '--vx-threshold',
+        type=float,
+        default=0.1,
+        help='Wrist velocity threshold (m/s) for defining force curve region '
+             '(default: 0.1). Force curve is fitted to frames where wrist vx > threshold.'
+    )
+    parser.add_argument(
+        '--handle-offset',
+        type=float,
+        default=0.0,
+        help='Offset from wrist to handle along forearm direction in metres '
+             '(default: 0.0 = no handle). Creates a synthetic handle point '
+             'projected from the wrist along the elbow→wrist direction. '
+             'Typical rowing value: 0.15 m. '
+             'Velocity and acceleration are identical to the wrist.'
+    )
     args = parser.parse_args()
     
     # Find all stroke files (plain JSON, not compressed)
@@ -1916,10 +2092,12 @@ def main():
         
         current_idx = [start_idx]
         fig_state = {}  # Shared state for figure reuse
-        fig, axes = show_plot(files[current_idx[0]], current_idx[0], len(files))
+        fig, axes = show_plot(files[current_idx[0]], current_idx[0], len(files), handle_offset_m=args.handle_offset, vx_threshold=args.vx_threshold)
         if fig:
             fig_state['fig'] = fig
             fig_state['axes'] = axes
+            fig_state['handle_offset_m'] = args.handle_offset
+            fig_state['vx_threshold'] = args.vx_threshold
             fig.canvas.mpl_connect('key_press_event', lambda e: on_key(e, files, current_idx, fig_state))
             print("\nKeyboard controls:")
             print("  Left/Right arrows: Navigate between strokes")

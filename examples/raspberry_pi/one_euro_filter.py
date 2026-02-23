@@ -77,7 +77,7 @@ class OneEuroFilter1D:
     __slots__ = ('min_cutoff', 'beta', 'd_cutoff', 'x_filter', 'dx_filter', 
                  'last_time', 'initialized')
     
-    def __init__(self, min_cutoff: float = 1.0, beta: float = 0.007, d_cutoff: float = 1.0):
+    def __init__(self, min_cutoff: float = 0.5, beta: float = 0.007, d_cutoff: float = 0.5):
         self.min_cutoff = min_cutoff
         self.beta = beta
         self.d_cutoff = d_cutoff
@@ -149,19 +149,19 @@ class OneEuroFilterOptimized:
         '_work_valid',
     )
     
-    def __init__(self, min_cutoff: float = 7.0, beta: float = 0.003, d_cutoff: float = 1.0):
+    def __init__(self, min_cutoff: float = 3.5, beta: float = 0.003, d_cutoff: float = 0.5):
         """
         Initialize One Euro Filter with pitchpipe-tuned defaults.
         
         Args:
             min_cutoff: Minimum cutoff frequency (Hz). 
                        Higher = less smoothing, more responsive.
-                       Default: 7.0 Hz (pitchpipe-tuned from stroke data)
+                       Default: 3.5 Hz (lowered from 7.0 for stronger high-freq filtering)
             beta: Speed coefficient. 
                   Higher = more responsive to fast movements.
                   Default: 0.003 (pitchpipe-tuned for rowing lag reduction)
             d_cutoff: Cutoff for derivative estimation.
-                      Default: 1.0 Hz
+                      Default: 0.5 Hz (lowered from 1.0 for smoother derivative)
         """
         self.min_cutoff = np.full(MAX_KEYPOINTS, min_cutoff, dtype=np.float32)
         self.beta = np.full(MAX_KEYPOINTS, beta, dtype=np.float32)
@@ -300,19 +300,19 @@ class OneEuroSmoother:
     __slots__ = ('_filter', '_frame_count')
     
     def __init__(self,
-                 min_cutoff: float = 7.0,
+                 min_cutoff: float = 3.5,
                  beta: float = 0.003,
-                 d_cutoff: float = 1.0):
+                 d_cutoff: float = 0.5):
         """
         Initialize One Euro Filter smoother with pitchpipe-tuned defaults.
         
         Args:
             min_cutoff: Minimum cutoff frequency (Hz).
-                       Default: 7.0 Hz (pitchpipe-tuned from stroke data)
+                       Default: 3.5 Hz (lowered from 7.0 for stronger high-freq filtering)
             beta: Speed coefficient.
                   Default: 0.003 (pitchpipe-tuned for rowing)
             d_cutoff: Derivative cutoff frequency (Hz).
-                     Default: 1.0 Hz
+                     Default: 0.5 Hz (lowered from 1.0 for smoother derivative)
         """
         self._filter = OneEuroFilterOptimized(
             min_cutoff=min_cutoff,
