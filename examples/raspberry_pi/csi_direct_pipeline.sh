@@ -32,7 +32,8 @@ echo "Docker containers can consume this with: usb:${DEVICE_NR}"
 echo ""
 
 # Stream CSI camera to v4l2loopback device using rpicam-vid
-# Using YUY2 format (optimized for low latency and high FPS)
+# Using videoconvertscale to combine scaling and I420->YUY2 conversion in a
+# single pass (avoids intermediate buffer copy vs separate videoscale+videoconvert)
 rpicam-vid \
   --width ${WIDTH} \
   --height ${HEIGHT} \
@@ -51,11 +52,11 @@ rpicam-vid \
   --saturation 1.0 \
   --metering average \
   -o - | \
-gst-launch-1.0 -e \
+gst-launch-1.0 -v -e \
   fdsrc do-timestamp=true ! \
   rawvideoparse width=${WIDTH} height=${HEIGHT} format=i420 framerate=${FPS}/1 ! \
-  videoscale ! \
-  video/x-raw,format=I420,width=${WIDTH},height=${HEIGHT} ! \
-  videoconvert ! \
-  video/x-raw,format=YUY2 ! \
-  v4l2sink device=/dev/video${DEVICE_NR} sync=false max-lateness=-1 qos=false
+  videoconvertscale ! \
+  video/x-raw,format=YUY2,width=${WIDTH},height=${HEIGHT} ! \
+  tee name=t \
+  t. ! queue leaky=downstream max-size-buffers=1 ! v4l2sink device=/dev/video${DEVICE_NR} sync=false max-lateness=-1 qos=false
+  t. ! queue ! fpsdisplaysink video-sink=fakesink text-overlay=false sync=false
