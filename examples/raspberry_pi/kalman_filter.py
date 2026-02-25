@@ -25,59 +25,51 @@ class KalmanFilterOptimized:
     Ultra-optimized 2D Kalman filter for pose keypoints.
     
     All arrays are pre-allocated and contiguous for maximum performance.
-    Uses simplified scalar Kalman filter per dimension (not full matrix form).
+    Uses frequency-aware gain: K = 1 - exp(-2π * fc * dt) for precise
+    cutoff frequency control and framerate independence.
     """
     __slots__ = (
-        'x', 'y', 'vx', 'vy', 'Px', 'Py',
+        'x', 'y', 'vx', 'vy',
         'initialized', 'last_update_time',  # Per-keypoint timestamp
-        'Q', 'R', 'alpha',
+        'cutoff_hz', 'alpha',
         '_work_innovation_x', '_work_innovation_y',
         '_work_K', '_work_valid'
     )
     
     def __init__(self, 
-                 process_noise: float = 0.01,
-                 measurement_noise: float = 0.5,
+                 cutoff_hz: float = 2.0,
                  velocity_alpha: float = 0.3):
         """
         Initialize with pre-allocated arrays.
         
         Args:
-            process_noise (Q): System noise - how much position/velocity can change
-                              Lower = smoother, more damping, less responsive
-                              Higher = more responsive, less smooth, follows noise
-                              Range: 0.001 (very smooth) to 0.1 (very responsive)
-                              Default: 0.01 = balanced tracking with motion prediction
-                              
-            measurement_noise (R): Measurement uncertainty - how much to trust raw detections
-                                  Lower = trust measurements more (faster tracking, less jitter smoothing)
-                                  Higher = trust measurements less (more smoothing, slower response)
-                                  Range: 0.1 (trust fully) to 10.0 (very skeptical)
-                                  Default: 0.5 = good balance for YOLO jitter removal with quick tracking
-                                  
-            velocity_alpha: Velocity learning rate for exponential moving average
-                           Controls how fast velocity estimate adapts to position changes
-                           Formula: v_new = (1-alpha)*v_old + alpha*(innovation/dt)
-                           Lower = velocity changes slowly (more stable, less overshoot)
-                           Higher = velocity tracks position changes quickly (responsive, quick direction changes)
+            cutoff_hz: Low-pass cutoff frequency in Hz.
+                       Controls the smoothing bandwidth — signals below this
+                       frequency pass through, higher frequencies are attenuated.
+                       Lower = smoother but laggier, higher = more responsive but noisier.
+                       Range: 1.0 (very smooth) to 10.0 (nearly raw)
+                       Recommended: 3.0-5.0 Hz for pose keypoint smoothing
+                       Default: 4.0 Hz = responsive tracking with jitter removal
+                       
+            velocity_alpha: Velocity learning rate for exponential moving average.
+                           Controls how fast velocity estimate adapts to changes.
+                           Lower = velocity changes slowly (more stable)
+                           Higher = velocity tracks changes quickly (responsive)
                            Range: 0.1 (very stable) to 0.9 (very responsive)
-                           Default: 0.7 = fast adaptation for quick response to movement changes
+                           Default: 0.3 = stable velocity estimation
         """
         # State arrays - separate x/y for better cache access
         self.x = np.zeros(MAX_KEYPOINTS, dtype=np.float32)
         self.y = np.zeros(MAX_KEYPOINTS, dtype=np.float32)
         self.vx = np.zeros(MAX_KEYPOINTS, dtype=np.float32)
         self.vy = np.zeros(MAX_KEYPOINTS, dtype=np.float32)
-        self.Px = np.full(MAX_KEYPOINTS, 100.0, dtype=np.float32)
-        self.Py = np.full(MAX_KEYPOINTS, 100.0, dtype=np.float32)
         self.initialized = np.zeros(MAX_KEYPOINTS, dtype=np.bool_)
         # MUST be float64 to handle time.time() values like 1738345678.123
         # float32 only has ~7 significant digits, can't distinguish consecutive timestamps
         self.last_update_time = np.zeros(MAX_KEYPOINTS, dtype=np.float64)
         
         # Parameters
-        self.Q = np.float32(process_noise)
-        self.R = np.float32(measurement_noise)
+        self.cutoff_hz = np.float32(cutoff_hz)
         self.alpha = np.float32(velocity_alpha)
         
         # Pre-allocated work arrays (avoid allocation in update)
@@ -117,8 +109,6 @@ class KalmanFilterOptimized:
             self.y[:n][new_mask] = my[new_mask]
             self.vx[:n][new_mask] = 0.0
             self.vy[:n][new_mask] = 0.0
-            self.Px[:n][new_mask] = 100.0
-            self.Py[:n][new_mask] = 100.0
             self.initialized[:n][new_mask] = True
             self.last_update_time[:n][new_mask] = timestamp
         
@@ -133,66 +123,45 @@ class KalmanFilterOptimized:
         dt_array[update_mask] = np.maximum(0.001, timestamp - self.last_update_time[:n][update_mask])
         
         # Detect keypoints that were invisible and just reappeared (large dt)
-        # If dt > 0.1s (6 frames at 60fps), consider it a reappearance - reset velocity
+        # If dt > 0.1s (3 frames at 30fps), consider it a reappearance
         reappeared_mask = update_mask & (dt_array > 0.1)
         if np.any(reappeared_mask):
             self.vx[:n][reappeared_mask] = 0.0
             self.vy[:n][reappeared_mask] = 0.0
-            self.Px[:n][reappeared_mask] = 100.0  # Reset covariance
-            self.Py[:n][reappeared_mask] = 100.0
-            # Clamp dt for reappeared keypoints to avoid huge prediction jumps
-            dt_array[reappeared_mask] = 0.0167
         
-        # === PREDICT STEP ===
-        # Skip velocity-based prediction - it adds jitter from noisy velocity estimates
-        # The Kalman filter still smooths positions, just without motion prediction
-        # Velocity is still tracked (for JSON output) but not used in position updates
-        # x_pred = x (no velocity prediction)
-        # self.x[:n][update_mask] += self.vx[:n][update_mask] * dt_array[update_mask]
-        # self.y[:n][update_mask] += self.vy[:n][update_mask] * dt_array[update_mask]
+        # === COMPUTE FREQUENCY-AWARE GAIN ===
+        # K = 1 - exp(-2π * fc * dt) gives exact cutoff at fc Hz
+        # Framerate-independent: same effective bandwidth regardless of FPS
+        K = 1.0 - np.exp(np.float32(-2.0 * np.pi) * self.cutoff_hz * dt_array)
+        np.clip(K, 0.01, 0.99, out=K)
         
-        # P_pred = P + Q
-        self.Px[:n][update_mask] += self.Q
-        self.Py[:n][update_mask] += self.Q
+        # Snap to measurement for reappeared keypoints (no smoothing delay)
+        if np.any(reappeared_mask):
+            K[reappeared_mask] = 1.0
         
         # === UPDATE STEP ===
-        # Innovation: y = z - x_pred
+        # Innovation: z - x_predicted
         np.subtract(mx, self.x[:n], out=self._work_innovation_x[:n])
         np.subtract(my, self.y[:n], out=self._work_innovation_y[:n])
         
-        # Kalman gain: K = P / (P + R)  [simplified scalar form]
-        # Process X dimension
-        Sx = self.Px[:n][update_mask] + self.R
-        Kx = self.Px[:n][update_mask] / Sx
-        
-        # Process Y dimension  
-        Sy = self.Py[:n][update_mask] + self.R
-        Ky = self.Py[:n][update_mask] / Sy
-        
         # State update: x = x + K * innovation
-        self.x[:n][update_mask] += Kx * self._work_innovation_x[:n][update_mask]
-        self.y[:n][update_mask] += Ky * self._work_innovation_y[:n][update_mask]
+        Km = K[update_mask]
+        self.x[:n][update_mask] += Km * self._work_innovation_x[:n][update_mask]
+        self.y[:n][update_mask] += Km * self._work_innovation_y[:n][update_mask]
         
-        # Velocity update: simple finite difference on smoothed positions
-        # Uses assumed constant dt (~10fps) instead of precise timestamp tracking
-        # This avoids timestamp precision issues while still providing velocity for JSON
-        assumed_dt = 0.1  # ~10fps assumed frame rate
-        
+        # Velocity update using actual dt for proper scaling
+        dt_masked = np.maximum(dt_array[update_mask], np.float32(0.001))
         self.vx[:n][update_mask] = (
             (1 - self.alpha) * self.vx[:n][update_mask] + 
-            self.alpha * self._work_innovation_x[:n][update_mask] / assumed_dt
+            self.alpha * self._work_innovation_x[:n][update_mask] / dt_masked
         )
         self.vy[:n][update_mask] = (
             (1 - self.alpha) * self.vy[:n][update_mask] + 
-            self.alpha * self._work_innovation_y[:n][update_mask] / assumed_dt
+            self.alpha * self._work_innovation_y[:n][update_mask] / dt_masked
         )
         
         # Update timestamps for keypoints we just processed
         self.last_update_time[:n][update_mask] = timestamp
-        
-        # Covariance update: P = (1 - K) * P
-        self.Px[:n][update_mask] *= (1 - Kx)
-        self.Py[:n][update_mask] *= (1 - Ky)
         
         # Write filtered positions back to input array (in-place)
         keypoints[:n, 0] = np.where(self.initialized[:n], self.x[:n], mx)
@@ -219,8 +188,6 @@ class KalmanFilterOptimized:
         self.y.fill(0)
         self.vx.fill(0)
         self.vy.fill(0)
-        self.Px.fill(100.0)
-        self.Py.fill(100.0)
         self.initialized.fill(False)
         self.last_update_time.fill(0.0)
 
@@ -233,12 +200,10 @@ class KeypointSmoother:
     __slots__ = ('_filter', '_frame_count')
     
     def __init__(self,
-                 process_noise: float = 0.01,
-                 measurement_noise: float = 1.0,
-                 velocity_alpha: float = 0.5):
+                 cutoff_hz: float = 4.0,
+                 velocity_alpha: float = 0.3):
         self._filter = KalmanFilterOptimized(
-            process_noise=process_noise,
-            measurement_noise=measurement_noise,
+            cutoff_hz=cutoff_hz,
             velocity_alpha=velocity_alpha
         )
         self._frame_count = 0

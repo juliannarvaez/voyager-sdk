@@ -566,11 +566,10 @@ def inference_loop_with_recording(args, log_file_path, stream, app, wnd, recorde
         LOG.info("No filtering - using raw keypoints")
     elif args.filter == 'kalman':
         smoother = KeypointSmoother(
-            process_noise=0.005,     # Lower: trust filter state more
-            measurement_noise=1.2,   # Higher: more skeptical of noisy detections
-            velocity_alpha=0.4       # Lower: smoother velocity estimation
+            cutoff_hz=4.0,           # Low-pass cutoff frequency (3-5Hz range)
+            velocity_alpha=0.3       # Stable velocity estimation
         )
-        LOG.info("Using Kalman filter: Q=0.005, R=1.2, alpha=0.4 (smoother)")
+        LOG.info("Using Kalman filter: cutoff=4.0Hz, alpha=0.3")
     elif args.filter == 'ekf':
         # Extended Kalman Filter - nonlinear motion model with acceleration
         # Tuned to reduce overshoot: trust measurements more, predict less
