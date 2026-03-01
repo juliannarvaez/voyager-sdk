@@ -1,0 +1,59 @@
+axelera-model-format: 1.0.0
+
+name: mobilenetv2-pose-svd
+
+description: >
+  MobileNetV2 heatmap pose with first ConvTranspose2d SVD-factored.
+  Conv1x1(1280→512) + ConvTranspose(512→256, k=4, s=2, p=1). Preserves
+  exact ConvTranspose spatial alignment. Other two ConvTranspose layers
+  (256→256) are unchanged and within MVM limits.
+
+pipeline:
+  - keypoint_detections:
+      model_name: mobilenetv2-pose-svd
+      input:
+        type: image
+      preprocess:
+        - resize:
+            width: 192
+            height: 256
+            interpolation: bilinear
+        - torch-totensor:
+        - normalize:
+            mean: 0.485, 0.456, 0.406
+            std: 0.229, 0.224, 0.225
+      postprocess:
+        - decode_heatmap_pose:
+            visibility_threshold: 0.0
+
+operators:
+  decode_heatmap_pose:
+    class: DecodeHeatmapPose
+    class_path: $AXELERA_FRAMEWORK/customers/heatmap_pose/decode_heatmap_pose.py
+
+models:
+  mobilenetv2-pose-svd:
+    class: AxONNXModel
+    class_path: $AXELERA_FRAMEWORK/ax_models/base_onnx.py
+    weight_path: $AXELERA_FRAMEWORK/customers/heatmap_pose/mobilenetv2_pose_svd_deconv.onnx
+    task_category: KeypointDetection
+    input_tensor_layout: NCHW
+    input_tensor_shape: [1, 3, 256, 192]
+    input_color_format: RGB
+    num_classes: 1
+    dataset: CocoDataset-keypoint-COCO2017
+    extra_kwargs:
+      aipu_cores: 1
+      unlimited_stack_for_compilation: true
+      compilation_config:
+        tiling_depth: 6
+        split_buffer_promotion: true
+        max_memplan_attempts: 15
+        max_tiling_attempts: 16
+
+datasets:
+  CocoDataset-keypoint-COCO2017:
+    class: KptDataAdapter
+    class_path: $AXELERA_FRAMEWORK/ax_datasets/objdataadapter.py
+    data_dir_name: coco
+    label_type: COCO2017
