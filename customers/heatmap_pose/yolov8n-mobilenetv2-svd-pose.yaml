@@ -1,0 +1,110 @@
+axelera-model-format: 1.0.0
+
+name: yolov8n-mobilenetv2-svd-pose
+
+description: >
+  Cascade pipeline: YOLOv8n person detector (3 AIPU cores) → MobileNetV2
+  SVD-factored heatmap pose (1 AIPU core). Stage 1 detects people, Stage 2
+  crops each person ROI and estimates 17 COCO keypoints from heatmaps.
+  Uses 256x192 input / 64x48 heatmap output.
+
+pipeline:
+  - detections:
+      model_name: yolov8n-coco-onnx
+      template_path: $AXELERA_FRAMEWORK/pipeline-template/yolo-letterbox.yaml
+      input:
+        type: image
+      postprocess:
+        - decodeyolo:
+            box_format: xywh
+            normalized_coord: False
+            max_nms_boxes: 30000
+            conf_threshold: 0.4
+            nms_iou_threshold: 0.45
+            nms_class_agnostic: True
+            nms_top_k: 10
+            use_multi_label: False
+            label_filter: [person]
+
+  - poses:
+      model_name: mobilenetv2-pose-svd
+      input:
+          type: image
+          color_format: RGB
+          source: roi
+          where: detections
+          which: AREA
+          top_k: 1
+          min_width: 40
+          min_height: 60
+      preprocess:
+        - resize:
+            width: 192
+            height: 256
+        - torch-totensor:
+        - normalize:
+            mean: 0.485, 0.456, 0.406
+            std: 0.229, 0.224, 0.225
+      postprocess:
+        - decode_heatmap_pose:
+            visibility_threshold: 0.0
+
+operators:
+  decodeyolo:
+    class: DecodeYolo
+    class_path: $AXELERA_FRAMEWORK/ax_models/decoders/yolo.py
+  decode_heatmap_pose:
+    class: DecodeHeatmapPose
+    class_path: $AXELERA_FRAMEWORK/customers/heatmap_pose/decode_heatmap_pose.py
+
+models:
+  yolov8n-coco-onnx:
+    class: AxONNXModel
+    class_path: $AXELERA_FRAMEWORK/ax_models/base_onnx.py
+    weight_path: weights/yolov8n_ultralytics_v8.1.0.onnx
+    weight_url: https://media.axelera.ai/artifacts/model_cards/weights/yolo/object_detection/yolov8n_ultralytics_v8.1.0.onnx
+    weight_md5: 2ec6c50f5cb0e059344f4ea7f72a3c41
+    task_category: ObjectDetection
+    input_tensor_layout: NCHW
+    input_tensor_shape: [1, 3, 640, 640]
+    input_color_format: RGB
+    num_classes: 80
+    dataset: CocoDataset-COCO2017
+    extra_kwargs:
+      aipu_cores: 3
+      compilation_config:
+        split_buffer_promotion: true
+        tiling_depth: 6
+
+  mobilenetv2-pose-svd:
+    class: AxONNXModel
+    class_path: $AXELERA_FRAMEWORK/ax_models/base_onnx.py
+    weight_path: $AXELERA_FRAMEWORK/customers/heatmap_pose/mobilenetv2_pose_svd_deconv.onnx
+    task_category: KeypointDetection
+    input_tensor_layout: NCHW
+    input_tensor_shape: [1, 3, 256, 192]
+    input_color_format: RGB
+    num_classes: 1
+    dataset: CocoDataset-keypoint-COCO2017
+    extra_kwargs:
+      aipu_cores: 1
+      unlimited_stack_for_compilation: true
+      compilation_config:
+        tiling_depth: 6
+        split_buffer_promotion: true
+        max_memplan_attempts: 15
+        max_tiling_attempts: 16
+
+datasets:
+  CocoDataset-COCO2017:
+    class: ObjDataAdapter
+    class_path: $AXELERA_FRAMEWORK/ax_datasets/objdataadapter.py
+    data_dir_name: coco
+    labels_path: $AXELERA_FRAMEWORK/ax_datasets/labels/coco.names
+    label_type: COCO2017
+
+  CocoDataset-keypoint-COCO2017:
+    class: KptDataAdapter
+    class_path: $AXELERA_FRAMEWORK/ax_datasets/objdataadapter.py
+    data_dir_name: coco
+    label_type: COCO2017
